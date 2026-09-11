@@ -14,16 +14,17 @@ def to_markdown(engine: dict[str, Any]) -> str:
     results = _results(engine)
     lines = [f"# {TITLE}", "", "## 1 Study and design", "", *_preamble(engine, results), ""]
 
-    raw_tables = _raw_tables(engine)
+    raw_tables = _sample_preview(engine)
+    lines.extend(["## 2 Raw data table", ""])
     if raw_tables:
-        lines.extend(["## 2 Raw data table", ""])
         for title, headers, rows in raw_tables:
             if title:
                 lines.extend([f"### {title}", ""])
+            lines.extend(["Data Sample Preview (First 5 Observations)", ""])
             lines.extend(_markdown_table(headers, rows))
             lines.append("")
     else:
-        lines.extend(["## 2 Raw data table", "", "Raw data were not included in the last engine JSON.", ""])
+        lines.extend(["Data Sample Preview (First 5 Observations)", "", "The raw dataset was not included in the last engine JSON.", ""])
 
     lines.extend(["## 3 Descriptive tables", ""])
     for index, result in enumerate(results, start=1):
@@ -70,14 +71,15 @@ def write_docx(engine: dict[str, Any], path: str | Path) -> str:
         document.add_paragraph(paragraph)
 
     document.add_heading("2 Raw data table", level=2)
-    raw_tables = _raw_tables(engine)
+    raw_tables = _sample_preview(engine)
     if raw_tables:
+        document.add_paragraph("Data Sample Preview (First 5 Observations)")
         for title, headers, rows in raw_tables:
             if title:
                 document.add_heading(title, level=3)
             _add_docx_table(document, headers, rows)
     else:
-        document.add_paragraph("Raw data were not included in the last engine JSON.")
+        document.add_paragraph("The raw dataset was not included in the last engine JSON.")
 
     document.add_heading("3 Descriptive tables", level=2)
     for index, result in enumerate(results):
@@ -132,15 +134,16 @@ def write_pdf(engine: dict[str, Any], path: str | Path) -> str:
     ]
     story.extend(Paragraph(_escape(paragraph), styles["RowfirstBody"]) for paragraph in _preamble(engine, results))
     story.extend([Spacer(1, 0.12 * inch), Paragraph("2 Raw data table", styles["Heading2"])])
-    raw_tables = _raw_tables(engine)
+    raw_tables = _sample_preview(engine)
     if raw_tables:
+        story.append(Paragraph("Data Sample Preview (First 5 Observations)", styles["Heading3"]))
         for title, headers, rows in raw_tables:
             if title:
                 story.append(Paragraph(_escape(title), styles["Heading4"]))
             story.append(_pdf_table(headers, rows, styles))
             story.append(Spacer(1, 0.1 * inch))
     else:
-        story.append(Paragraph("Raw data were not included in the last engine JSON.", styles["RowfirstBody"]))
+        story.append(Paragraph("The raw dataset was not included in the last engine JSON.", styles["RowfirstBody"]))
 
     story.append(Paragraph("3 Descriptive tables", styles["Heading2"]))
     for result in results:
@@ -284,6 +287,14 @@ def _sample_description(results: list[dict[str, Any]]) -> str:
     if other_sizes:
         return "Sample sizes: " + "; ".join(dict.fromkeys(other_sizes)) + "."
     return "Sample size: not reported by the engine."
+
+
+def _sample_preview(engine: dict[str, Any]) -> list[tuple[str, list[str], list[tuple[str, ...]]]]:
+    tables = _raw_tables(engine)
+    preview: list[tuple[str, list[str], list[tuple[str, ...]]]] = []
+    for title, headers, rows in tables:
+        preview.append((title, headers, rows[:5]))
+    return preview
 
 
 def _raw_tables(engine: dict[str, Any]) -> list[tuple[str, list[str], list[tuple[str, ...]]]]:
@@ -614,12 +625,14 @@ def _discussion_evidence_target(result: dict[str, Any]) -> str:
 
 
 def _synthesis_paragraph(results: list[dict[str, Any]], topic: str) -> str:
+    power = _power_status(results)
     if results and all(result.get("test") == "paired-t" for result in results):
         story = "; ".join(
             _paired_synthesis_fragment(result) for result in results
         ) + "."
         context = f"Taken together in {topic}, " if topic else "Taken together, "
-        return context + story + " " + _discussion_significance_sentence(results)
+        prefix = f"{power} " if power else ""
+        return prefix + context + story + " " + _discussion_significance_sentence(results)
     group_directions = [_group_direction(result) for result in results]
     group_directions = [item for item in group_directions if item]
     other_results = [
@@ -658,7 +671,8 @@ def _synthesis_paragraph(results: list[dict[str, Any]], topic: str) -> str:
     else:
         story = "; ".join(_synthesis_fragment(result) for result in results) + "."
     context = f"Taken together in {topic}, " if topic else "Taken together, "
-    return context + story + " " + _discussion_significance_sentence(results)
+    prefix = f"{power} " if power else ""
+    return prefix + context + story + " " + _discussion_significance_sentence(results)
 
 
 def _direction_story(name: str, labels: list[str], direction: str) -> str:
@@ -698,7 +712,7 @@ def _paired_synthesis_fragment(result: dict[str, Any]) -> str:
 
 def _discussion_limits(results: list[dict[str, Any]]) -> str:
     clauses = []
-    if _has_sample_size(results):
+    if _has_small_group_sample(results):
         clauses.append("Small n limits how widely this pattern can be generalized")
     if any(result.get("test") in {"one-way anova", "two-way anova"} for result in results):
         clauses.append("ANOVA does not establish that every pair of groups differs")
@@ -730,6 +744,48 @@ def _discussion_outcome_limit(results: list[dict[str, Any]]) -> str:
         f"Higher or lower values on {label_text} describe the measured response only; "
         "practical conclusions require additional domain evidence"
     )
+
+
+def _power_status(results: list[dict[str, Any]]) -> str | None:
+    sizes = []
+    for result in results:
+        if result.get("test") in {"student-t", "welch-t"}:
+            sizes.extend([int(result["group1"].get("n", 0)), int(result["group2"].get("n", 0))])
+        elif result.get("test") == "one-way anova":
+            sizes.extend(int(group.get("n", 0)) for group in result.get("groups", []))
+        elif result.get("test") == "paired-t":
+            sizes.append(int(result.get("nPairs", 0)))
+        elif result.get("n") is not None:
+            sizes.append(int(result.get("n", 0)))
+        for key in ("before", "after", "group1", "group2"):
+            group = result.get(key)
+            if isinstance(group, dict) and group.get("n") is not None:
+                sizes.append(int(group.get("n", 0)))
+    if not sizes:
+        return None
+    total_n = sum(max(0, value) for value in sizes)
+    minimum_group_n = min((value for value in sizes if value > 0), default=0)
+    if total_n >= 300 or minimum_group_n >= 50:
+        return "The cohort is an adequately powered, robust, and substantial sample size."
+    return None
+
+
+def _has_small_group_sample(results: list[dict[str, Any]]) -> bool:
+    sizes = []
+    for result in results:
+        if result.get("test") in {"student-t", "welch-t"}:
+            sizes.extend([int(result["group1"].get("n", 0)), int(result["group2"].get("n", 0))])
+        elif result.get("test") == "one-way anova":
+            sizes.extend(int(group.get("n", 0)) for group in result.get("groups", []))
+        elif result.get("test") == "paired-t":
+            sizes.append(int(result.get("nPairs", 0)))
+        elif result.get("n") is not None:
+            sizes.append(int(result.get("n", 0)))
+        for key in ("before", "after", "group1", "group2"):
+            group = result.get(key)
+            if isinstance(group, dict) and group.get("n") is not None:
+                sizes.append(int(group.get("n", 0)))
+    return any(size > 0 and size < 30 for size in sizes)
 
 
 def _has_sample_size(results: list[dict[str, Any]]) -> bool:

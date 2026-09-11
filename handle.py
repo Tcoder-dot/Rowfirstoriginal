@@ -532,7 +532,7 @@ def _breakdown_sample_once(results: list[dict[str, Any]]) -> str:
 
 def _breakdown_limits(results: list[dict[str, Any]]) -> str:
     clauses = []
-    if _breakdown_has_sample_size(results):
+    if _has_small_group_sample(results):
         clauses.append("Small n limits how widely this pattern can be generalized")
     if any(result.get("test") in {"one-way anova", "two-way anova"} for result in results):
         clauses.append("ANOVA does not establish that every pair of groups differs")
@@ -570,10 +570,57 @@ def _breakdown_sample_caveat(results: list[dict[str, Any]]) -> str:
     count_total = _breakdown_count_total(results)
     if count_total is not None:
         return f"Count total: {count_total}; counts are not replicate measurements."
+    power = _power_status(results)
+    if power:
+        return power
     sample = _breakdown_sample_once(results)
     if sample == "sample size was not reported":
         return "n caveat: sample size was not reported."
-    return f"n caveat: {sample}; this is a small sample, not a huge trial."
+    if _has_small_group_sample(results):
+        return f"n caveat: {sample}; this is a small sample, not a huge trial."
+    return f"Sample size: {sample}; the cohort is adequately powered, robust, and substantial."
+
+
+def _power_status(results: list[dict[str, Any]]) -> str | None:
+    sizes = []
+    for result in results:
+        if result.get("test") in {"student-t", "welch-t"}:
+            sizes.extend([int(result["group1"].get("n", 0)), int(result["group2"].get("n", 0))])
+        elif result.get("test") == "one-way anova":
+            sizes.extend(int(group.get("n", 0)) for group in result.get("groups", []))
+        elif result.get("test") == "paired-t":
+            sizes.append(int(result.get("nPairs", 0)))
+        elif result.get("n") is not None:
+            sizes.append(int(result.get("n", 0)))
+        for key in ("before", "after", "group1", "group2"):
+            group = result.get(key)
+            if isinstance(group, dict) and group.get("n") is not None:
+                sizes.append(int(group.get("n", 0)))
+    if not sizes:
+        return None
+    total_n = sum(max(0, value) for value in sizes)
+    minimum_group_n = min((value for value in sizes if value > 0), default=0)
+    if total_n >= 300 or minimum_group_n >= 50:
+        return "Sample size: the cohort is an adequately powered, robust, and substantial sample size."
+    return None
+
+
+def _has_small_group_sample(results: list[dict[str, Any]]) -> bool:
+    sizes = []
+    for result in results:
+        if result.get("test") in {"student-t", "welch-t"}:
+            sizes.extend([int(result["group1"].get("n", 0)), int(result["group2"].get("n", 0))])
+        elif result.get("test") == "one-way anova":
+            sizes.extend(int(group.get("n", 0)) for group in result.get("groups", []))
+        elif result.get("test") == "paired-t":
+            sizes.append(int(result.get("nPairs", 0)))
+        elif result.get("n") is not None:
+            sizes.append(int(result.get("n", 0)))
+        for key in ("before", "after", "group1", "group2"):
+            group = result.get(key)
+            if isinstance(group, dict) and group.get("n") is not None:
+                sizes.append(int(group.get("n", 0)))
+    return any(size > 0 and size < 30 for size in sizes)
 
 
 def _breakdown_has_sample_size(results: list[dict[str, Any]]) -> bool:

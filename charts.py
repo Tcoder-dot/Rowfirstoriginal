@@ -27,18 +27,21 @@ def make_charts(
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     charts: list[dict[str, Any]] = []
-    for index, result in enumerate(_results(engine)):
-        if len(charts) >= max_charts:
-            break
-        path = destination / f"outcome-{index + 1}.png"
-        try:
-            chart = _render_chart(engine, result, path)
-        except Exception:
-            chart = None
-        if chart is not None and path.exists():
-            chart["result_index"] = index
-            charts.append(chart)
-    return charts
+    try:
+        for index, result in enumerate(_results(engine)):
+            if len(charts) >= max_charts:
+                break
+            path = destination / f"outcome-{index + 1}.png"
+            try:
+                chart = _render_chart(engine, result, path)
+            except Exception:
+                chart = None
+            if chart is not None and path.exists():
+                chart["result_index"] = index
+                charts.append(chart)
+        return charts
+    finally:
+        plt.close('all')
 
 
 def make_chart(engine: dict[str, Any], output_path: str | Path) -> str | None:
@@ -129,6 +132,7 @@ def _render_chart(
         fig.savefig(path, dpi=160, format="png")
     finally:
         plt.close(fig)
+        plt.close('all')
     return {"path": str(path), "outcome": outcome, "caption": caption}
 
 

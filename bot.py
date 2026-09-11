@@ -117,16 +117,58 @@ def _numeric_table_columns(frame: pd.DataFrame) -> list[str]:
     return numeric
 
 
+def _is_identifier_column(frame: pd.DataFrame, column: str) -> bool:
+    if column not in frame.columns:
+        return False
+    normalized = _table_column_name(column)
+    if re.search(r"(?:^id$|_id$|record|serial|uuid|identifier)", normalized, flags=re.I):
+        return True
+    if normalized in _TABLE_ID_NAMES:
+        return True
+    series = frame[column]
+    if pd.api.types.is_numeric_dtype(series):
+        return False
+    non_null = series.dropna()
+    if non_null.empty:
+        return False
+    unique_count = int(non_null.nunique(dropna=True))
+    row_count = len(frame)
+    if unique_count == row_count:
+        return True
+    ratio = unique_count / max(1, row_count)
+    if ratio > 0.5 and unique_count >= max(10, int(row_count * 0.2)):
+        return True
+    return False
+
+
+def _is_binary_or_flag_numeric(series: pd.Series) -> bool:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.empty:
+        return False
+    unique = values.nunique(dropna=True)
+    if unique <= 2:
+        return True
+    return bool(set(values.unique()) <= {0.0, 1.0})
+
+
+def _is_valid_continuous_outcome(series: pd.Series) -> bool:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.empty or len(values) < 10:
+        return False
+    unique = values.nunique(dropna=True)
+    if unique <= 10:
+        return False
+    variance = float(values.var(ddof=1)) if len(values) > 1 else 0.0
+    return bool(np.isfinite(variance) and variance > 0.0)
+
+
 def _multivariate_table_route(frame: pd.DataFrame | None) -> dict[str, Any] | None:
     """Classify a table before it enters the existing ingestion/engine path."""
     if frame is None or frame.shape[1] < 2:
         return None
-    numeric_columns = _numeric_table_columns(frame)
+    numeric_columns = [column for column in _numeric_table_columns(frame) if not _is_identifier_column(frame, column)]
     numeric_set = set(numeric_columns)
-    identifier_columns = [
-        column for column in frame.columns
-        if _table_column_name(column) in _TABLE_ID_NAMES
-    ]
+    identifier_columns = [column for column in frame.columns if _is_identifier_column(frame, column)]
     factor_columns: list[str] = [
         column for column in frame.columns
         if column not in numeric_set and column not in identifier_columns
@@ -136,7 +178,9 @@ def _multivariate_table_route(frame: pd.DataFrame | None) -> dict[str, Any] | No
         values = pd.to_numeric(frame[column], errors="coerce").dropna()
         integer_like = bool(values.size) and bool((values % 1 == 0).all())
         low_cardinality = values.nunique() >= 2 and values.nunique() <= min(12, max(3, len(frame) // 3))
-        if normalized in _TABLE_FACTOR_NAMES or (integer_like and low_cardinality and normalized.endswith("time")):
+        if _is_binary_or_flag_numeric(frame[column]):
+            continue
+        elif normalized in _TABLE_FACTOR_NAMES or (integer_like and low_cardinality and normalized.endswith("time")):
             factor_columns.append(column)
 
     # A conventional two-column Treatment/Value table already has an
@@ -149,7 +193,15 @@ def _multivariate_table_route(frame: pd.DataFrame | None) -> dict[str, Any] | No
     ):
         return None
 
-    outcome_columns = [column for column in numeric_columns if column not in factor_columns]
+    outcome_columns = [
+        column for column in numeric_columns
+        if column not in factor_columns and not _is_binary_or_flag_numeric(frame[column]) and _is_valid_continuous_outcome(frame[column])
+    ]
+    if not outcome_columns:
+        outcome_columns = [
+            column for column in numeric_columns
+            if column not in factor_columns and not _is_binary_or_flag_numeric(frame[column])
+        ]
     if factor_columns and outcome_columns:
         return {
             "kind": "multivariate",
@@ -179,6 +231,8 @@ def _group_size_error(ingested: dict[str, Any]) -> str | None:
 
 def _singleton_groups_for_frame(frame: pd.DataFrame, factor_name: str) -> list[dict[str, Any]]:
     if frame.empty or factor_name not in frame.columns:
+        return []
+    if _is_identifier_column(frame, factor_name):
         return []
     counts = frame[factor_name].dropna().value_counts(dropna=False)
     return [{"name": str(name), "n": int(count)} for name, count in counts.items() if count == 1]
@@ -394,13 +448,10 @@ def _deliver_requested_outputs(bot: Any, call: Any, engine: dict[str, Any], chat
         frame = session.get("df")
     if frame is None:
         frame = _frame_from_engine(engine)
-    with tempfile.TemporaryDirectory(prefix="rowfirst-output-") as tmp:
-        tmp_dir = Path(tmp)
-        if requested in {"docx", "full"}:
-            docx_path = tmp_dir / "Rowfirst_Results.docx"
-            write_docx(engine, docx_path)
-            with open(docx_path, "rb") as document_file:
-                bot.send_document(chat_id, document_file, caption="Compiled by Rowfirst Engine — 100% Deterministic SciPy Execution (Zero LLM Calculation Drift)")
+        try:
+            bot.send_chat_action(chat_id, "upload_document")
+        except Exception:
+            pass
         if requested in {"pdf", "full"}:
             pdf_path = tmp_dir / "Rowfirst_Results.pdf"
             try:
@@ -424,9 +475,23 @@ def _deliver_requested_outputs(bot: Any, call: Any, engine: dict[str, Any], chat
 
 def _detect_singleton_factor(frame: pd.DataFrame) -> str | None:
     for column in frame.columns:
-        if frame[column].dropna().nunique() <= 1:
+        if _is_identifier_column(frame, column):
             continue
-        counts = frame[column].dropna().value_counts(dropna=False)
+        series = frame[column]
+        non_null = series.dropna()
+        if non_null.empty or non_null.nunique() <= 1:
+            continue
+        if pd.api.types.is_numeric_dtype(series):
+            unique_count = int(non_null.nunique(dropna=True))
+            if unique_count > min(12, max(3, len(frame) // 10)):
+                continue
+        else:
+            unique_count = int(non_null.nunique(dropna=True))
+            row_count = len(frame)
+            ratio = unique_count / max(1, row_count)
+            if ratio > 0.5 and unique_count >= max(10, int(row_count * 0.2)):
+                continue
+        counts = non_null.value_counts(dropna=False)
         if (counts == 1).any():
             return str(column)
     return None
@@ -602,6 +667,10 @@ def _send_analysis(
     if not engine.get("ok"):
         bot.reply_to(message, engine.get("question") or engine.get("error", "I could not analyse that.")[:4000])
         return
+    try:
+        bot.send_chat_action(message.chat.id, "typing")
+    except Exception:
+        pass
     results = engine.get("results") or [engine.get("result")]
     results = [result for result in results if result]
     result_lines = ["Outcome | Test | Statistic | p | Decision", *[_summary_line(result) for result in results]]
@@ -611,6 +680,7 @@ def _send_analysis(
     qa_text = "\n".join(f"- {item}" for item in qa_lines) if qa_lines else "none"
     if "charts" not in engine:
         try:
+            bot.send_chat_action(message.chat.id, "upload_document")
             engine["charts"] = make_charts(
                 engine,
                 tempfile.mkdtemp(prefix="rowfirst-charts-"),
@@ -703,6 +773,56 @@ def _run_analysis(text: str) -> dict[str, Any]:
         if metadata["discuss"]:
             engine["discuss"] = True
     return engine
+
+
+def _column_lookup(frame: pd.DataFrame, query: str) -> str | None:
+    if frame is None or query is None:
+        return None
+    normalized_query = re.sub(r"[^a-z0-9]+", "", str(query).lower())
+    for column in frame.columns:
+        normalized_column = re.sub(r"[^a-z0-9]+", "", str(column).lower())
+        if normalized_column == normalized_query or normalized_query in normalized_column or normalized_column in normalized_query:
+            return str(column)
+    return None
+
+
+def _evaluate_conversational_query(chat_id: int, text: str) -> dict[str, Any] | None:
+    session = user_sessions.get(chat_id, {})
+    frame = session.get("df") if isinstance(session, dict) else None
+    if frame is None or frame.empty:
+        return None
+    lower = (text or "").strip()
+    if not lower:
+        return None
+
+    regression_match = re.search(r"(?:run|do|perform)?\s*regression\s+(?:between|on)\s+(.+?)\s+(?:and|vs|versus)\s+(.+?)(?:\s*$|\?|\.)", lower, flags=re.I)
+    if regression_match:
+        left = _column_lookup(frame, regression_match.group(1))
+        right = _column_lookup(frame, regression_match.group(2))
+        if left and right:
+            values = frame[[left, right]].dropna()
+            if len(values) >= 3:
+                return {"kind": "regression", "x": left, "y": right, "frame": values}
+
+    compare_match = re.search(r"compare\s+(.+?)\s+across\s+(.+?)(?:\s*$|\?|\.)", lower, flags=re.I)
+    if compare_match:
+        metric = _column_lookup(frame, compare_match.group(1))
+        factor = _column_lookup(frame, compare_match.group(2))
+        if metric and factor:
+            values = frame[[factor, metric]].dropna()
+            if len(values) >= 4:
+                return {"kind": "compare", "factor": factor, "metric": metric, "frame": values}
+
+    test_match = re.search(r"test\s+(.+?)\s+on\s+(.+?)(?:\s*$|\?|\.)", lower, flags=re.I)
+    if test_match:
+        factor = _column_lookup(frame, test_match.group(1))
+        metric = _column_lookup(frame, test_match.group(2))
+        if factor and metric:
+            values = frame[[factor, metric]].dropna()
+            if len(values) >= 4:
+                return {"kind": "compare", "factor": factor, "metric": metric, "frame": values}
+
+    return None
 
 
 def _defense_qa(engine: dict[str, Any]) -> str:
@@ -841,6 +961,7 @@ def main() -> None:
             bot.reply_to(message, "Send a table first.")
             return False
         try:
+            bot.send_chat_action(message.chat.id, "upload_document")
             with tempfile.TemporaryDirectory(prefix="rowfirst-results-") as tmp:
                 docx_path = Path(tmp) / "Rowfirst_Results.docx"
                 write_docx(engine, docx_path)
@@ -910,15 +1031,6 @@ def main() -> None:
                 "df": route["frame"],
                 "timestamp": time.time(),
             }
-        singleton_factor = _detect_singleton_factor(route["frame"])
-        if singleton_factor:
-            user_sessions[message.chat.id]["singleton_factor"] = singleton_factor
-            bot.reply_to(
-                message,
-                "I found singleton group(s) in the active factor. Choose how to proceed:",
-                reply_markup=_singleton_triage_markup(),
-            )
-            return
         _send_ingestion_card(bot, message, route["frame"], offer_download=True)
         pending_multivariate[message.chat.id] = {
             "frame": route["frame"],

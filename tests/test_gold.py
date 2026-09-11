@@ -12,8 +12,15 @@ from statsmodels.formula.api import ols
 from statsmodels.stats.anova import anova_lm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from bot import _send_analysis, _python_script_to_dataframe, _summarize_dataframe, _singleton_groups_for_frame
-from chapter4 import write_docx
+from bot import (
+    _detect_singleton_factor,
+    _multivariate_table_route,
+    _send_analysis,
+    _python_script_to_dataframe,
+    _summarize_dataframe,
+    _singleton_groups_for_frame,
+)
+from chapter4 import write_docx, to_markdown
 from charts import make_charts
 from handle import handle_analyze
 
@@ -171,6 +178,59 @@ df = pd.DataFrame({
     if singleton_groups != expected:
         fails.append(f"singleton detection returned {singleton_groups!r}, expected {expected!r}")
 
+    unique_df = pd.DataFrame({
+        "Record_ID": [f"R{i}" for i in range(1, 11)],
+        "Department": ["A", "A", "B", "B", "A", "B", "A", "B", "A", "B"],
+        "Value": [10, 12, 9, 13, 11, 15, 12, 14, 11, 16],
+    })
+    route = _multivariate_table_route(unique_df)
+    if route is None or route.get("kind") != "multivariate":
+        fails.append(f"ID filtering route should remain multivariate, got {route!r}")
+    elif "Record_ID" in route.get("factors", []):
+        fails.append("ID column leaked into factor list")
+    if _detect_singleton_factor(unique_df) is not None:
+        fails.append("singleton detection should ignore unique row identifiers")
+
+    stress_path = Path(__file__).resolve().parent.parent / "stress_test_200col_1000rows.csv"
+    if stress_path.exists():
+        stress_df = pd.read_csv(stress_path)
+        route = _multivariate_table_route(stress_df)
+        if route is None or route.get("kind") != "multivariate":
+            fails.append(f"stress dataset route unexpectedly rejected: {route!r}")
+        else:
+            factors = route.get("factors", [])
+            if "Department" not in factors or "Customer_Segment" not in factors:
+                fails.append(f"valid department/segment factors missing from stress route: {factors[:12]}")
+            if any(col in factors for col in ["Record_ID", "Customer_ID", "Order_ID"]):
+                fails.append(f"identifier columns reached stress route factors: {factors[:12]}")
+            singleton_factor = _detect_singleton_factor(stress_df)
+            if singleton_factor is not None:
+                fails.append(f"stress dataset singleton detection should ignore IDs and valid factors, got {singleton_factor!r}")
+
+    flag_df = pd.DataFrame({
+        "Department": ["A", "A", "B", "B", "A", "B", "A", "B", "A", "B"],
+        "Is_Loyal": [0, 1, 0, 1, 0, 1, 1, 0, 1, 1],
+        "Net_Sales_Value": [120, 135, 90, 140, 125, 150, 110, 160, 130, 170],
+        "Basket_Item_Count": [3, 4, 2, 5, 4, 6, 3, 5, 4, 7],
+    })
+    route = _multivariate_table_route(flag_df)
+    if route is None or route.get("kind") != "multivariate":
+        fails.append(f"flagged multivariate route should stay multivariate: {route!r}")
+    elif "Is_Loyal" in route.get("factors", []) or "Is_Loyal" in route.get("outcomes", []):
+        fails.append(f"binary flag column leaked into route factors/outcomes: {route!r}")
+    elif "Net_Sales_Value" not in route.get("outcomes", []):
+        fails.append(f"continuous outcome not preserved in route: {route!r}")
+
+    preview_engine = {
+        "ok": True,
+        "ingested": {"format": "labelled", "groups": [{"name": "A", "values": [10, 11, 12, 13, 14, 15, 16, 17, 18, 19]}, {"name": "B", "values": [20, 21, 22, 23, 24, 25, 26, 27, 28, 29]}]},
+        "results": [{"test": "one-way anova", "groups": [{"name": "A", "n": 10, "mean": 15.0, "sd": 3.0}, {"name": "B", "n": 10, "mean": 25.0, "sd": 3.0}], "F": 42.0, "dfb": 1, "dfw": 18, "p": 0.0001, "isSignificant": True, "parameter": "Net_Sales_Value"}],
+    }
+    preview_markdown = to_markdown(preview_engine)
+    if "Data Sample Preview (First 5 Observations)" not in preview_markdown:
+        fails.append("word/pdf markdown preview heading missing")
+    if "10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19" in preview_markdown:
+        fails.append("raw preview leaked full observation rows into markdown output")
     return fails
 
 
