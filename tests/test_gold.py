@@ -6,12 +6,13 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+import pandas as pd
 from scipy import stats
 from statsmodels.formula.api import ols
 from statsmodels.stats.anova import anova_lm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from bot import _send_analysis
+from bot import _send_analysis, _python_script_to_dataframe, _summarize_dataframe, _singleton_groups_for_frame
 from chapter4 import write_docx
 from charts import make_charts
 from handle import handle_analyze
@@ -140,6 +141,39 @@ def telegram_regression_failures():
     return failures
 
 
+def feature_regressions():
+    fails = []
+
+    script = '''
+import pandas as pd
+import numpy as np
+rng = np.random.default_rng(7)
+df = pd.DataFrame({
+    "group": ["A", "A", "B", "B", "C", "C"],
+    "score": [10, 11, 14, 15, 9, 12],
+    "age": [20, 21, 23, 24, 19, 28],
+})
+'''
+    frame = _python_script_to_dataframe(script)
+    if frame is None or frame.shape != (6, 3):
+        fails.append(f"python script did not produce a 6x3 dataframe: {frame.shape if frame is not None else frame}")
+
+    summary = _summarize_dataframe(frame)
+    if "Shape" not in summary or "Categorical Factors" not in summary or "Numeric Metrics" not in summary:
+        fails.append("dataset summary card missing required sections")
+
+    singleton_frame = pd.DataFrame({
+        "group": ["A", "A", "B", "C"],
+        "score": [10, 11, 12, 13],
+    })
+    singleton_groups = _singleton_groups_for_frame(singleton_frame, "group")
+    expected = [{"name": "B", "n": 1}, {"name": "C", "n": 1}]
+    if singleton_groups != expected:
+        fails.append(f"singleton detection returned {singleton_groups!r}, expected {expected!r}")
+
+    return fails
+
+
 def main():
     fails = []
 
@@ -220,6 +254,7 @@ def main():
     elif not near(r["slope"], expected_regression.slope, 1e-10) or not near(r["r"], expected_regression.rvalue, 1e-10):
         fails.append(f"F slope/r {r.get('slope')}/{r.get('r')}")
 
+    fails.extend(feature_regressions())
     fails.extend(chart_regression_failures())
     fails.extend(reporting_regression_failures())
     fails.extend(telegram_regression_failures())

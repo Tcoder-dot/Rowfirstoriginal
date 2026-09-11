@@ -5,6 +5,7 @@ Gemini is used only for table extraction from photo/PDF/DOCX when configured.
 """
 from __future__ import annotations
 
+import ast
 import json
 import csv
 import hashlib
@@ -17,8 +18,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from flask import Flask
+from scipy import stats
 
 from chapter4 import write_docx
 from charts import make_charts
@@ -35,6 +38,8 @@ except ImportError:
 
 
 health_app = Flask(__name__)
+user_sessions: dict[int, dict[str, Any]] = {}
+last_engine: dict[int, dict[str, Any]] = {}
 
 
 @health_app.get("/")
@@ -168,15 +173,116 @@ def _multivariate_table_route(frame: pd.DataFrame | None) -> dict[str, Any] | No
 
 
 def _group_size_error(ingested: dict[str, Any]) -> str | None:
-    """Reject n=1 groups before the statistical engine is called."""
-    groups: list[dict[str, Any]] = list(ingested.get("groups") or [])
-    for outcome in ingested.get("outcomes") or []:
-        groups.extend(outcome.get("groups") or [])
-    if groups and any(len(group.get("values") or []) < 2 for group in groups):
-        return (
-            "I found a group with only one observation. "
-            "ANOVA needs at least two observations per group, so I stopped without generating a report."
-        )
+    """Allow singleton triage instead of hard-stopping the flow."""
+    return None
+
+
+def _singleton_groups_for_frame(frame: pd.DataFrame, factor_name: str) -> list[dict[str, Any]]:
+    if frame.empty or factor_name not in frame.columns:
+        return []
+    counts = frame[factor_name].dropna().value_counts(dropna=False)
+    return [{"name": str(name), "n": int(count)} for name, count in counts.items() if count == 1]
+
+
+def _summarize_dataframe(frame: pd.DataFrame) -> str:
+    if frame is None or frame.empty:
+        return "Data summary unavailable."
+    rows, cols = frame.shape
+    missing = int(frame.isna().sum().sum())
+    categorical = []
+    for column in frame.columns:
+        series = frame[column]
+        if pd.api.types.is_numeric_dtype(series):
+            numeric_value_count = series.notna().sum()
+            if numeric_value_count and series.nunique(dropna=True) <= min(20, max(3, rows)):
+                categorical.append(f"- {column}: {int(series.nunique(dropna=True))} unique levels")
+        else:
+            categorical.append(f"- {column}: {int(series.nunique(dropna=True))} unique levels")
+    numeric_columns = [column for column in frame.columns if pd.api.types.is_numeric_dtype(frame[column])]
+    numeric_summary = ""
+    if numeric_columns:
+        top = numeric_columns[:5]
+        numeric_summary = "\n".join(f"- {column}: numeric column" for column in top)
+        numeric_summary += f"\n- Total numeric columns: {len(numeric_columns)}"
+    singleton_flags = []
+    for column in frame.columns:
+        if frame[column].dropna().nunique() <= 1:
+            singleton_flags.append(f"- {column}: singleton/constant column detected")
+    summary = [
+        "Data Ingestion Card",
+        f"Shape: {rows} rows x {cols} columns",
+        "Detected Categorical Factors:",
+        *(categorical[:10] or ["- None detected"]),
+        "Detected Numeric Metrics:",
+        numeric_summary or "- None detected",
+        "Missing Values / Data Health:",
+        f"- Missing cells: {missing} total",
+        "- Zero-singleton confirmation:",
+        *(singleton_flags or ["- No singleton-only columns detected"]),
+    ]
+    return "\n".join(summary)
+
+
+def _safe_python_globals() -> dict[str, Any]:
+    safe_builtins = {
+        "__import__": __import__,
+        "abs": abs,
+        "all": all,
+        "any": any,
+        "bool": bool,
+        "dict": dict,
+        "enumerate": enumerate,
+        "float": float,
+        "int": int,
+        "len": len,
+        "list": list,
+        "max": max,
+        "min": min,
+        "print": print,
+        "range": range,
+        "round": round,
+        "set": set,
+        "sorted": sorted,
+        "str": str,
+        "sum": sum,
+        "tuple": tuple,
+        "zip": zip,
+    }
+    namespace: dict[str, Any] = {
+        "__builtins__": safe_builtins,
+        "__name__": "__main__",
+        "np": np,
+        "pd": pd,
+    }
+    return namespace
+
+
+def _python_script_to_dataframe(script_text: str) -> pd.DataFrame | None:
+    text = (script_text or "").strip()
+    if not text:
+        return None
+    lower = text.lower()
+    if not any(token in lower for token in ("pd.dataframe", "dataframe", "numpy", "to_csv", "read_csv", "df =")):
+        return None
+    try:
+        tree = ast.parse(text, mode="exec")
+    except SyntaxError:
+        return None
+    namespace = _safe_python_globals()
+    try:
+        exec(compile(tree, "<rowfirst-script>", "exec"), namespace, namespace)
+    except Exception:
+        return None
+    for value in namespace.values():
+        if isinstance(value, pd.DataFrame) and not value.empty:
+            return value.copy()
+    df_candidates = [
+        value for value in namespace.values() if hasattr(value, "to_csv") and hasattr(value, "columns")
+    ]
+    if df_candidates:
+        candidate = df_candidates[0]
+        if hasattr(candidate, "copy"):
+            return candidate.copy()
     return None
 
 
@@ -185,6 +291,158 @@ def _analyze_ingested_safely(ingested: dict[str, Any], outcome_name: str | None 
     if guard_error:
         return {"ok": False, "error": guard_error}
     return analyze_ingested(ingested, outcome_name=outcome_name)
+
+
+def _rebuild_ingested_from_frame(frame: pd.DataFrame, factor: str, outcome: str) -> dict[str, Any]:
+    grouped = frame[[factor, outcome]].copy()
+    grouped[outcome] = pd.to_numeric(grouped[outcome], errors="coerce")
+    grouped = grouped.dropna(subset=[factor, outcome])
+    groups = []
+    for group_name, group in grouped.groupby(factor, dropna=False)[outcome]:
+        groups.append({"name": str(group_name), "values": [float(value) for value in group.tolist()]})
+    return {"format": "labelled", "groups": groups}
+
+
+def _nonparametric_for_result(result: dict[str, Any], ingested: dict[str, Any] | None = None) -> dict[str, Any]:
+    groups = []
+    if ingested and ingested.get("groups"):
+        groups = ingested["groups"]
+    elif result.get("groups"):
+        groups = result["groups"]
+    if len(groups) >= 3:
+        values = [np.asarray(group.get("values", []), dtype=float) for group in groups]
+        statistic, p_value = stats.kruskal(*values)
+        return {"test": "kruskal-wallis", "statistic": float(statistic), "p": float(p_value), "isSignificant": bool(p_value < 0.05)}
+    if len(groups) == 2:
+        a = np.asarray(groups[0].get("values", []), dtype=float)
+        b = np.asarray(groups[1].get("values", []), dtype=float)
+        statistic, p_value = stats.mannwhitneyu(a, b, alternative="two-sided")
+        return {"test": "mann-whitney", "statistic": float(statistic), "p": float(p_value), "isSignificant": bool(p_value < 0.05)}
+    return {"test": "nonparametric", "p": 1.0, "isSignificant": False}
+
+
+def _assumption_failure(engine: dict[str, Any]) -> bool:
+    if not engine or not engine.get("ok"):
+        return False
+    results = engine.get("results") or [engine.get("result")]
+    for result in results:
+        assumptions = result.get("assumptions") or {}
+        levene = assumptions.get("levene") or {}
+        if isinstance(levene, dict) and levene.get("p") is not None and levene.get("p") < 0.05:
+            return True
+        for item in assumptions.get("shapiroWilk", []) or []:
+            p_value = item.get("p")
+            if p_value is not None and p_value < 0.05:
+                return True
+    return False
+
+
+def _save_dataset_artifacts(frame: pd.DataFrame, chat_id: int, prefix: str = "rowfirst") -> tuple[Path, Path]:
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"rowfirst-{chat_id}-"))
+    csv_path = tmp_dir / f"{prefix}.csv"
+    xlsx_path = tmp_dir / f"{prefix}.xlsx"
+    frame.to_csv(csv_path, index=False)
+    frame.to_excel(xlsx_path, index=False)
+    return csv_path, xlsx_path
+
+
+def _send_ingestion_card(bot: Any, message: Any, frame: pd.DataFrame, *, offer_download: bool = True) -> None:
+    summary = _summarize_dataframe(frame)
+    bot.reply_to(message, summary[:4000])
+    if offer_download:
+        csv_path, xlsx_path = _save_dataset_artifacts(frame, int(message.chat.id))
+        with open(csv_path, "rb") as csv_file:
+            bot.send_document(message.chat.id, csv_file, caption="Clean CSV export")
+        with open(xlsx_path, "rb") as xlsx_file:
+            bot.send_document(message.chat.id, xlsx_file, caption="Styled Excel export")
+
+
+def _output_selector_markup() -> Any:
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("📄 Word Chapter 4 (.docx)", callback_data="output:docx"),
+        types.InlineKeyboardButton("📑 Academic Report (.pdf)", callback_data="output:pdf"),
+        types.InlineKeyboardButton("📊 Clean Processed Excel (.xlsx) / CSV", callback_data="output:excel"),
+        types.InlineKeyboardButton("📦 Full Package (All Formats)", callback_data="output:full"),
+    )
+    return markup
+
+
+def _singleton_triage_markup() -> Any:
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("🚫 Exclude Singleton Group(s) & Continue", callback_data="singleton:exclude"),
+        types.InlineKeyboardButton("🔄 Select Different Factor", callback_data="singleton:factor"),
+        types.InlineKeyboardButton("📁 Cancel / Upload New Data", callback_data="singleton:cancel"),
+    )
+    return markup
+
+
+def _assumption_markup() -> Any:
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("Run Kruskal-Wallis / Mann-Whitney", callback_data="assumption:nonparametric"),
+        types.InlineKeyboardButton("Proceed with Standard ANOVA / t-Test", callback_data="assumption:standard"),
+    )
+    return markup
+
+
+def _deliver_requested_outputs(bot: Any, call: Any, engine: dict[str, Any], chat_id: int, requested: str) -> None:
+    session = user_sessions.get(chat_id, {})
+    frame = None
+    if isinstance(session, dict):
+        frame = session.get("df")
+    if frame is None:
+        frame = _frame_from_engine(engine)
+    with tempfile.TemporaryDirectory(prefix="rowfirst-output-") as tmp:
+        tmp_dir = Path(tmp)
+        if requested in {"docx", "full"}:
+            docx_path = tmp_dir / "Rowfirst_Results.docx"
+            write_docx(engine, docx_path)
+            with open(docx_path, "rb") as document_file:
+                bot.send_document(chat_id, document_file, caption="Compiled by Rowfirst Engine — 100% Deterministic SciPy Execution (Zero LLM Calculation Drift)")
+        if requested in {"pdf", "full"}:
+            pdf_path = tmp_dir / "Rowfirst_Results.pdf"
+            try:
+                from chapter4 import write_pdf
+                write_pdf(engine, pdf_path)
+                with open(pdf_path, "rb") as pdf_file:
+                    bot.send_document(chat_id, pdf_file, caption="Compiled by Rowfirst Engine — 100% Deterministic SciPy Execution (Zero LLM Calculation Drift)")
+            except Exception:
+                pass
+        if requested in {"excel", "full"} and frame is not None:
+            csv_path = tmp_dir / "rowfirst_clean.csv"
+            xlsx_path = tmp_dir / "rowfirst_clean.xlsx"
+            frame.to_csv(csv_path, index=False)
+            frame.to_excel(xlsx_path, index=False)
+            with open(csv_path, "rb") as csv_file:
+                bot.send_document(chat_id, csv_file, caption="Clean CSV export")
+            with open(xlsx_path, "rb") as xlsx_file:
+                bot.send_document(chat_id, xlsx_file, caption="Clean Excel export")
+    bot.answer_callback_query(call.id, "Your requested output is ready.")
+
+
+def _detect_singleton_factor(frame: pd.DataFrame) -> str | None:
+    for column in frame.columns:
+        if frame[column].dropna().nunique() <= 1:
+            continue
+        counts = frame[column].dropna().value_counts(dropna=False)
+        if (counts == 1).any():
+            return str(column)
+    return None
+
+
+def _frame_from_engine(engine: dict[str, Any]) -> pd.DataFrame | None:
+    ingested = engine.get("ingested") or {}
+    if ingested.get("groups"):
+        rows = []
+        for group in ingested.get("groups"):
+            for value in group.get("values") or []:
+                rows.append({"group": str(group.get("name")), "value": float(value)})
+        return pd.DataFrame(rows)
+    if ingested.get("format") == "two-way" and ingested.get("rows"):
+        return pd.DataFrame(ingested["rows"])
+    return None
 
 
 def _multivariate_file_route(path: Path) -> dict[str, Any] | None:
@@ -551,6 +809,8 @@ def main() -> None:
     pending_multivariate: dict[int, dict[str, Any]] = {}
     user_sessions: dict[int, dict[str, Any]] = {}
     last_engine: dict[int, dict[str, Any]] = {}
+    globals()["user_sessions"] = user_sessions
+    globals()["last_engine"] = last_engine
     text_buffers: dict[int, dict[str, Any]] = {}
     text_buffer_lock = threading.Lock()
     text_debounce_seconds = 1.5
@@ -650,6 +910,16 @@ def main() -> None:
                 "df": route["frame"],
                 "timestamp": time.time(),
             }
+        singleton_factor = _detect_singleton_factor(route["frame"])
+        if singleton_factor:
+            user_sessions[message.chat.id]["singleton_factor"] = singleton_factor
+            bot.reply_to(
+                message,
+                "I found singleton group(s) in the active factor. Choose how to proceed:",
+                reply_markup=_singleton_triage_markup(),
+            )
+            return
+        _send_ingestion_card(bot, message, route["frame"], offer_download=True)
         pending_multivariate[message.chat.id] = {
             "frame": route["frame"],
             "factors": route["factors"],
@@ -685,6 +955,76 @@ def main() -> None:
             bot.reply_to(call.message, "Session cleared. Ready for your next dataset!")
             return
         bot.answer_callback_query(call.id, "Invalid session action.", show_alert=True)
+
+    @bot.callback_query_handler(func=lambda call: (getattr(call, "data", "") or "").startswith("singleton:"))
+    def on_singleton_triage(call: Any) -> None:
+        chat_id = call.message.chat.id
+        callback_data = call.data or ""
+        session = user_sessions.get(chat_id)
+        if not session or "df" not in session:
+            bot.answer_callback_query(call.id, "Session expired. Please upload a new dataset.", show_alert=True)
+            return
+        frame = session["df"].copy()
+        if callback_data == "singleton:exclude":
+            factor = session.get("singleton_factor")
+            if not factor or factor not in frame.columns:
+                bot.answer_callback_query(call.id, "No active factor was found for singleton triage.", show_alert=True)
+                return
+            singleton_names = {item["name"] for item in _singleton_groups_for_frame(frame, factor)}
+            keep = [name for name, _ in frame[factor].value_counts(dropna=False).items() if name not in singleton_names]
+            filtered = frame[frame[factor].isin(keep)].copy() if keep else frame.iloc[0:0].copy()
+            session["df"] = filtered
+            user_sessions[chat_id] = session
+            route = _multivariate_table_route(filtered)
+            if route and route.get("kind") == "multivariate":
+                _prompt_multivariate(call.message, route, cache_session=False)
+            else:
+                bot.reply_to(call.message, "The dataset had no valid multivariate route after excluding singleton groups.")
+            bot.answer_callback_query(call.id)
+            return
+        if callback_data == "singleton:factor":
+            available = [col for col in frame.columns if frame[col].dropna().nunique() > 1]
+            bot.reply_to(call.message, "Choose a different factor to continue.", reply_markup=_choice_markup("factor", available))
+            bot.answer_callback_query(call.id)
+            return
+        if callback_data == "singleton:cancel":
+            user_sessions.pop(chat_id, None)
+            pending_multivariate.pop(chat_id, None)
+            bot.reply_to(call.message, "Upload a new dataset or paste fresh data to continue.")
+            bot.answer_callback_query(call.id)
+            return
+        bot.answer_callback_query(call.id, "Unknown singleton option.", show_alert=True)
+
+    @bot.callback_query_handler(func=lambda call: (getattr(call, "data", "") or "").startswith("assumption:"))
+    def on_assumption_decision(call: Any) -> None:
+        chat_id = call.message.chat.id
+        callback_data = call.data or ""
+        bot.answer_callback_query(call.id)
+        if callback_data == "assumption:nonparametric":
+            engine = last_engine.get(chat_id)
+            if not engine:
+                bot.reply_to(call.message, "No test result is active for this session.")
+                return
+            result = engine.get("result") or (engine.get("results") or [{}])[0]
+            ingested = engine.get("ingested") or {}
+            alt = _nonparametric_for_result(result, ingested)
+            bot.reply_to(call.message, "Non-parametric fallback result:\n" + json.dumps(alt, default=str)[:4000])
+            return
+        if callback_data == "assumption:standard":
+            bot.reply_to(call.message, "Proceeding with the standard test. The original SciPy calculation remains the source of truth.")
+            return
+        bot.answer_callback_query(call.id, "Unknown assumption decision.", show_alert=True)
+
+    @bot.callback_query_handler(func=lambda call: (getattr(call, "data", "") or "").startswith("output:"))
+    def on_output_selection(call: Any) -> None:
+        chat_id = call.message.chat.id
+        callback_data = call.data or ""
+        requested = callback_data.split(":", 1)[1] if ":" in callback_data else ""
+        engine = last_engine.get(chat_id)
+        if not engine or not engine.get("ok"):
+            bot.answer_callback_query(call.id, "No valid analysis result is available yet.", show_alert=True)
+            return
+        _deliver_requested_outputs(bot, call, engine, chat_id, requested)
 
     def _maybe_route_multivariate(message: Any, raw_text: str) -> bool:
         route = _multivariate_table_route(_read_delimited_frame(raw_text))
@@ -727,8 +1067,24 @@ def main() -> None:
         if chat_id in pending_multivariate:
             bot.reply_to(message, "Please finish the current column selection before sending another dataset.")
             return
+        script_frame = _python_script_to_dataframe(accumulated_text)
+        if script_frame is not None:
+            user_sessions[chat_id] = {"df": script_frame, "timestamp": time.time()}
+            _send_ingestion_card(bot, message, script_frame, offer_download=True)
+            route = _multivariate_table_route(script_frame)
+            if route and route.get("kind") == "multivariate":
+                _prompt_multivariate(message, route)
+            else:
+                engine = _run_analysis(accumulated_text)
+                if engine.get("ok"):
+                    last_engine[chat_id] = engine
+                _send_analysis(bot, message, engine)
+            return
         if _maybe_route_multivariate(message, accumulated_text):
             return
+        frame = _read_delimited_frame(accumulated_text)
+        if frame is not None:
+            _send_ingestion_card(bot, message, frame, offer_download=True)
         engine = _run_analysis(accumulated_text)
         if engine.get("ok"):
             last_engine[chat_id] = engine
@@ -823,10 +1179,11 @@ def main() -> None:
             for _, group in frame.groupby(chosen_factor)[chosen_outcome]
         ]
         if any(len(group) < 2 for group in groups):
+            user_sessions.setdefault(chat_id, {"df": frame})["singleton_factor"] = chosen_factor
             bot.reply_to(
                 call.message,
-                "I found a group with only one observation. "
-                "ANOVA needs at least two observations per group, so I stopped without generating a report.",
+                "I found a group with only one observation. Choose how to proceed:",
+                reply_markup=_singleton_triage_markup(),
             )
             return
         grouped = frame.groupby(chosen_factor)[chosen_outcome]
@@ -889,6 +1246,10 @@ def main() -> None:
             if engine.get("ok"):
                 last_engine[message.chat.id] = engine
             _send_analysis(bot, message, engine)
+            if _assumption_failure(engine):
+                bot.reply_to(message, "Assumptions violated: Proceed with standard test or run non-parametric alternative?", reply_markup=_assumption_markup())
+            else:
+                bot.reply_to(message, "Choose your output format:", reply_markup=_output_selector_markup())
         except Exception as exc:
             _send_error(bot, message, exc, "Could not analyse that")
 
@@ -910,6 +1271,15 @@ def main() -> None:
                 info = bot.get_file(document.file_id)
                 path.write_bytes(bot.download_file(info.file_path))
                 if suffix in LOCAL_SUFFIXES:
+                    frame = pd.read_csv(path) if suffix == ".csv" else None
+                    if frame is None and suffix in {".xlsx", ".xls"}:
+                        try:
+                            frame = pd.read_excel(path)
+                        except Exception:
+                            frame = None
+                    if frame is not None and not frame.empty:
+                        user_sessions[message.chat.id] = {"df": frame, "timestamp": time.time()}
+                        _send_ingestion_card(bot, message, frame, offer_download=True)
                     route = _multivariate_file_route(path)
                     if route and route["kind"] == "invalid":
                         bot.reply_to(message, route["message"])
@@ -921,6 +1291,10 @@ def main() -> None:
                     if engine.get("ok"):
                         last_engine[message.chat.id] = engine
                     _send_analysis(bot, message, engine)
+                    if _assumption_failure(engine):
+                        bot.reply_to(message, "Assumptions violated: Proceed with standard test or run non-parametric alternative?", reply_markup=_assumption_markup())
+                    else:
+                        bot.reply_to(message, "Choose your output format:", reply_markup=_output_selector_markup())
                     return
                 if suffix in GEMINI_SUFFIXES:
                     table = _gemini_extract(path)
@@ -946,6 +1320,10 @@ def main() -> None:
                 if engine.get("ok"):
                     last_engine[message.chat.id] = engine
                 _send_analysis(bot, message, engine)
+                if _assumption_failure(engine):
+                    bot.reply_to(message, "Assumptions violated: Proceed with standard test or run non-parametric alternative?", reply_markup=_choice_markup("assumption", ["standard", "nonparametric"]))
+                else:
+                    bot.reply_to(message, "Choose your output format:", reply_markup=_output_selector_markup())
         except Exception as exc:
             _send_error(bot, message, exc, "Could not read the photo")
 

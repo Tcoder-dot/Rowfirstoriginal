@@ -63,6 +63,7 @@ def write_docx(engine: dict[str, Any], path: str | Path) -> str:
     results = _results(engine)
     document = Document()
     document.add_heading(TITLE, level=1)
+    document.add_paragraph("Compiled by Rowfirst Engine — 100% Deterministic SciPy Execution (Zero LLM Calculation Drift)")
     document.add_paragraph("Statistical analysis and working built from the verified engine JSON.")
     document.add_heading("1 Study and design", level=2)
     for paragraph in _preamble(engine, results):
@@ -125,6 +126,7 @@ def write_pdf(engine: dict[str, Any], path: str | Path) -> str:
     styles.add(ParagraphStyle(name="RowfirstSmall", parent=styles["BodyText"], alignment=TA_LEFT, fontSize=8, leading=10))
     story = [
         Paragraph(_escape(TITLE), styles["Title"]),
+        Paragraph("Compiled by Rowfirst Engine — 100% Deterministic SciPy Execution (Zero LLM Calculation Drift)", styles["RowfirstBody"]),
         PageBreak(),
         Paragraph("1 Study and design", styles["Heading2"]),
     ]
