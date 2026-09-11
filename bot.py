@@ -40,6 +40,7 @@ except ImportError:
 health_app = Flask(__name__)
 user_sessions: dict[int, dict[str, Any]] = {}
 last_engine: dict[int, dict[str, Any]] = {}
+_INGESTION_DELIVERY_CACHE: set[tuple[int, int]] = set()
 
 
 @health_app.get("/")
@@ -106,6 +107,45 @@ def _read_delimited_frame(raw_text: str) -> pd.DataFrame | None:
         return None
     frame = frame.dropna(axis=0, how="all").dropna(axis=1, how="all")
     return frame if frame.shape[1] >= 2 and not frame.empty else None
+
+
+def _clean_currency_like_cell(value: Any) -> Any:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return value
+    if not isinstance(value, str):
+        return value
+    cleaned = value.strip()
+    if not cleaned:
+        return ""
+    cleaned = cleaned.replace("₦", "").replace("$", "").replace("€", "").replace("£", "")
+    cleaned = cleaned.replace(",", "").replace("%", "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def sanitize_incoming_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Normalize uploaded and extracted data before routing to the deterministic stats engine."""
+    if df is None or df.empty:
+        return df
+    sanitized = df.copy()
+    sanitized = sanitized.dropna(axis=0, how="all").dropna(axis=1, how="all")
+    sanitized.columns = [str(column).strip() for column in sanitized.columns]
+    for column in sanitized.columns:
+        series = sanitized[column].copy()
+        cleaned = series.map(_clean_currency_like_cell)
+        if cleaned.empty:
+            continue
+        numeric_like = cleaned.map(lambda value: isinstance(value, str) and bool(re.fullmatch(r"[-+]?\d*\.?\d+(?:e[-+]?\d+)?", value.strip())))
+        if numeric_like.any():
+            try:
+                coerced = pd.to_numeric(cleaned, errors="coerce")
+                if coerced.notna().sum() >= max(1, int(len(cleaned) * 0.8)):
+                    sanitized[column] = coerced
+                    continue
+            except Exception:
+                pass
+        sanitized[column] = cleaned.map(lambda value: value.strip() if isinstance(value, str) else value)
+    return sanitized
 
 
 def _numeric_table_columns(frame: pd.DataFrame) -> list[str]:
@@ -400,8 +440,63 @@ def _save_dataset_artifacts(frame: pd.DataFrame, chat_id: int, prefix: str = "ro
     return csv_path, xlsx_path
 
 
+def _begin_ingestion(chat_id: int) -> bool:
+    session = user_sessions.setdefault(chat_id, {})
+    if session.get("ingesting_locked"):
+        return False
+    session["ingesting_locked"] = True
+    user_sessions[chat_id] = session
+    return True
+
+
+def _finish_ingestion(chat_id: int) -> None:
+    session = user_sessions.get(chat_id)
+    if isinstance(session, dict):
+        session.pop("ingesting_locked", None)
+    user_sessions[chat_id] = session
+
+
+def _normalize_copy_text(text: str) -> str:
+    if not text:
+        return text
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    lines: list[str] = []
+    for line in normalized.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            lines.append("")
+            continue
+        if stripped.startswith(("RESULTS", "BREAKDOWN", "QA", "Data Ingestion Card", "Detected Categorical Factors", "Detected Numeric Metrics", "Missing Values / Data Health")):
+            lines.append(line)
+            continue
+        if stripped.startswith(("-", "•")):
+            lines.append(line)
+            continue
+        lines.append(re.sub(r"\s*[-–—]\s+", ", ", line))
+    normalized = "\n".join(lines)
+    normalized = re.sub(r"\n\s*\n+", "\n\n", normalized)
+    normalized = re.sub(r"[ \t]{2,}", " ", normalized)
+    normalized = re.sub(r"\s+,\s*", ", ", normalized)
+    return normalized.strip()
+
+
+def _mark_message_processed(chat_id: int, message_id: int | None) -> bool:
+    if message_id is None:
+        return True
+    cache_key = (int(chat_id), int(message_id))
+    if cache_key in _INGESTION_DELIVERY_CACHE:
+        return False
+    _INGESTION_DELIVERY_CACHE.add(cache_key)
+    if len(_INGESTION_DELIVERY_CACHE) > 2000:
+        _INGESTION_DELIVERY_CACHE.clear()
+    return True
+
+
 def _send_ingestion_card(bot: Any, message: Any, frame: pd.DataFrame, *, offer_download: bool = True) -> None:
-    summary = _summarize_dataframe(frame)
+    message_id = getattr(message, "message_id", None)
+    if not _mark_message_processed(int(message.chat.id), message_id):
+        return
+    summary = _normalize_copy_text(_summarize_dataframe(frame))
     bot.reply_to(message, summary[:4000])
     if offer_download:
         csv_path, xlsx_path = _save_dataset_artifacts(frame, int(message.chat.id))
@@ -419,6 +514,18 @@ def _output_selector_markup() -> Any:
         types.InlineKeyboardButton("📊 Clean Processed Excel (.xlsx) / CSV", callback_data="output:excel"),
         types.InlineKeyboardButton("📦 Full Package (All Formats)", callback_data="output:full"),
     )
+    return markup
+
+
+def _active_dataset_query_markup(frame: pd.DataFrame) -> Any:
+    if frame is None or frame.empty:
+        return None
+    choices = [column for column in frame.columns if column and not _is_identifier_column(frame, column)]
+    if not choices:
+        return None
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for column in choices[:8]:
+        markup.add(types.InlineKeyboardButton(str(column), callback_data=f"active_query:{column}"))
     return markup
 
 
@@ -567,13 +674,21 @@ GEMINI_SUFFIXES = {".pdf", ".docx", ".doc"}
 GEMINI_FALLBACK = (
     "Add GEMINI_API_KEY in Secrets to read PDF/Word. You can still paste the table or send CSV."
 )
-GEMINI_MODEL = "gemini-3.6-flash"
+# Prefer the newest generally available model, but keep a safe fallback chain for
+# environments that do not yet expose the newest name.
+DEFAULT_GEMINI_MODELS = [
+    os.getenv("GEMINI_MODEL"),
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+]
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 GEMINI_UNAVAILABLE = (
-    "Gemini could not read this file because the configured model is unavailable. "
-    "Please try again later or paste the table/send CSV."
+    "I couldn’t read that image or document clearly. "
+    "Please send a CSV or Excel file, or paste the table directly, and I’ll analyze it right away."
 )
 GEMINI_FAILED = (
-    "Gemini could not read this file right now. Please try again or paste the table/send CSV."
+    "I couldn’t extract a clean table from that image or document. "
+    "Please send a CSV/Excel file or paste the table directly so I can continue with the analysis."
 )
 MIME_SUFFIXES = {
     "text/csv": ".csv",
@@ -598,6 +713,27 @@ class GeminiNoTableError(GeminiExtractionError):
     """Gemini returned no usable table."""
 
 
+def _validate_extracted_table(table: Any) -> bool:
+    """Reject malformed or low-value OCR output before it reaches the stats pipeline."""
+    if not isinstance(table, dict):
+        return False
+    headers = table.get("headers")
+    rows = table.get("rows")
+    if not isinstance(headers, list) or not headers or len(headers) < 2:
+        return False
+    if not isinstance(rows, list) or not rows:
+        return False
+    expected_columns = len(headers)
+    for row in rows:
+        if not isinstance(row, list):
+            return False
+        if len(row) != expected_columns:
+            return False
+        if not any(str(cell).strip() for cell in row if cell is not None):
+            return False
+    return True
+
+
 def _upload_suffix(filename: str, mime_type: str) -> str:
     suffix = Path(filename).suffix.lower()
     if suffix in LOCAL_SUFFIXES or suffix in GEMINI_SUFFIXES:
@@ -605,48 +741,101 @@ def _upload_suffix(filename: str, mime_type: str) -> str:
     return MIME_SUFFIXES.get((mime_type or "").split(";", 1)[0].strip().lower(), "")
 
 
+def _csv_text_to_table(raw: str) -> dict[str, Any] | None:
+    """Normalize OCR output into a table dict that the bot can safely analyze."""
+    cleaned = (raw or "").strip()
+    if not cleaned:
+        return None
+    cleaned = re.sub(r"^```(?:csv|json|text)?\s*|\s*```$", "", cleaned, flags=re.I | re.S).strip()
+    if not cleaned or cleaned.upper() in {"NO_TABLE", "NONE", "N/A"}:
+        return None
+    if cleaned.startswith("{"):
+        try:
+            payload = json.loads(cleaned)
+            if _validate_extracted_table(payload):
+                return {"headers": payload["headers"], "rows": payload["rows"]}
+        except json.JSONDecodeError:
+            pass
+    try:
+        frame = pd.read_csv(io.StringIO(cleaned), sep=None, engine="python")
+    except Exception:
+        frame = None
+    if frame is None or frame.empty:
+        lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+        if not lines or "|" not in cleaned:
+            return None
+        try:
+            rows = [line.split("|") for line in lines if "|" in line]
+            if not rows:
+                return None
+            header = [cell.strip() for cell in rows[0]]
+            data_rows = [[cell.strip() for cell in row] for row in rows[1:]]
+            if len(header) < 2 or not data_rows:
+                return None
+            if all(len(row) == len(header) for row in data_rows):
+                frame = pd.DataFrame(data_rows, columns=header)
+        except Exception:
+            return None
+    if frame is None or frame.empty:
+        return None
+    frame = sanitize_incoming_dataframe(frame)
+    if frame is None or frame.empty or frame.shape[1] < 2:
+        return None
+    headers = [str(column).strip() for column in frame.columns.tolist()]
+    rows = frame.fillna("").astype(str).values.tolist()
+    if not _validate_extracted_table({"headers": headers, "rows": rows}):
+        return None
+    return {"headers": headers, "rows": rows}
+
+
 def _gemini_extract(path: Path) -> dict[str, Any]:
     key = os.getenv("GEMINI_API_KEY")
     if not key:
         raise GeminiExtractionError(GEMINI_FALLBACK)
-    try:
-        import google.generativeai as genai
+    mime = {
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".doc": "application/msword",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(path.suffix.lower(), "application/octet-stream")
+    prompt = (
+        "You are an OCR + table-extraction assistant. "
+        "Read the supplied image or document and recover the tabular data as clean CSV or JSON. "
+        "Preserve headers and values exactly, but remove OCR noise and formatting artifacts. "
+        "Return only a machine-readable CSV table or a JSON object shaped like {'headers':[...], 'rows':[[...], ...]}. "
+        "Do not add comments, explanations, or calculations. If no table is present, return 'NO_TABLE'."
+    )
+    last_error: Exception | None = None
+    for model_name in dict.fromkeys(model for model in DEFAULT_GEMINI_MODELS if model):
+        try:
+            import google.generativeai as genai
 
-        # gemini-2.0-flash is no longer available for this API key. Keep the
-        # model explicit so a retired model does not look like a missing key.
-        mime = {
-            ".pdf": "application/pdf",
-            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            ".doc": "application/msword",
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".png": "image/png",
-            ".webp": "image/webp",
-        }.get(path.suffix.lower(), "application/octet-stream")
-        genai.configure(api_key=key)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        prompt = (
-            'Extract only tables as JSON {"headers": [...], "rows": [...]}. '
-            "No statistics. No chapter. Preserve the headers, labels, and values exactly."
-        )
-        response = model.generate_content([prompt, {"mime_type": mime, "data": path.read_bytes()}])
-        raw = response.text.strip()
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I | re.S).strip()
-        payload = json.loads(raw)
-        headers = payload.get("headers")
-        rows = payload.get("rows")
-        if not headers or not isinstance(headers, list) or not isinstance(rows, list) or not rows:
-            raise GeminiNoTableError("I couldn’t find a table in that file. Please send a file with a table or paste it.")
-        if any(not isinstance(row, list) for row in rows):
-            raise GeminiNoTableError("I couldn’t find a table in that file. Please send a file with a table or paste it.")
-        return {"headers": headers, "rows": rows}
-    except GeminiExtractionError:
-        raise
-    except Exception as exc:
-        print(f"Gemini extraction failed: {type(exc).__name__}", flush=True)
-        if type(exc).__name__ == "NotFound":
-            raise GeminiExtractionError(GEMINI_UNAVAILABLE) from exc
-        raise GeminiExtractionError(GEMINI_FAILED) from exc
+            genai.configure(api_key=key)
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content([
+                prompt,
+                {"mime_type": mime, "data": path.read_bytes()},
+            ])
+            raw = (getattr(response, "text", "") or "").strip()
+            payload = _csv_text_to_table(raw)
+            if payload is None:
+                raise GeminiNoTableError(GEMINI_FAILED)
+            return payload
+        except GeminiExtractionError as exc:
+            last_error = exc
+            continue
+        except Exception as exc:
+            last_error = exc
+            print(f"Gemini extraction failed with model {model_name}: {type(exc).__name__}", flush=True)
+            continue
+    if isinstance(last_error, GeminiExtractionError):
+        raise last_error
+    if isinstance(last_error, Exception) and type(last_error).__name__ == "NotFound":
+        raise GeminiExtractionError(GEMINI_UNAVAILABLE) from last_error
+    raise GeminiExtractionError(GEMINI_FAILED)
 
 
 def _table_as_csv(table: dict[str, Any]) -> str:
@@ -705,6 +894,7 @@ def _send_analysis(
 
 
 def _reply_block(bot: Any, message: Any, text: str) -> None:
+    text = _normalize_copy_text(text)
     if len(text) > 3900:
         text = text[:3890].rstrip() + "\n…"
     bot.reply_to(message, text)
@@ -1027,11 +1217,7 @@ def main() -> None:
         cache_session: bool = True,
     ) -> None:
         if cache_session:
-            user_sessions[message.chat.id] = {
-                "df": route["frame"],
-                "timestamp": time.time(),
-            }
-        _send_ingestion_card(bot, message, route["frame"], offer_download=True)
+            user_sessions[message.chat.id] = {"df": route["frame"]}
         pending_multivariate[message.chat.id] = {
             "frame": route["frame"],
             "factors": route["factors"],
@@ -1052,12 +1238,12 @@ def main() -> None:
         bot.answer_callback_query(call.id)
         if callback_data == "session:rerun":
             session = user_sessions.get(chat_id)
-            if not session:
-                bot.reply_to(call.message, "Session expired. Please paste or upload your dataset again.")
+            if not session or "df" not in session:
+                bot.reply_to(call.message, "No active dataset is loaded. Please paste or upload a dataset to continue.")
                 return
             route = _multivariate_table_route(session.get("df"))
             if not route or route.get("kind") != "multivariate":
-                bot.reply_to(call.message, "Session expired. Please paste or upload your dataset again.")
+                bot.reply_to(call.message, "The current dataset is not in a multivariate route. Please paste or upload a fresh dataset.")
                 return
             _prompt_multivariate(call.message, route, cache_session=False)
             return
@@ -1074,7 +1260,7 @@ def main() -> None:
         callback_data = call.data or ""
         session = user_sessions.get(chat_id)
         if not session or "df" not in session:
-            bot.answer_callback_query(call.id, "Session expired. Please upload a new dataset.", show_alert=True)
+            bot.answer_callback_query(call.id, "No active dataset is loaded. Please upload or paste a new dataset to continue.", show_alert=True)
             return
         frame = session["df"].copy()
         if callback_data == "singleton:exclude":
@@ -1170,37 +1356,44 @@ def main() -> None:
 
     def _process_pasted_text(message: Any, accumulated_text: str) -> None:
         chat_id = message.chat.id
-        line_count = len([line for line in accumulated_text.splitlines() if line.strip()])
-        if line_count > 50:
-            bot.reply_to(
-                message,
-                "Tip: For large datasets (100+ rows), uploading as a .csv or .txt file avoids Telegram message splitting.",
-            )
-        if chat_id in pending_multivariate:
-            bot.reply_to(message, "Please finish the current column selection before sending another dataset.")
+        if not _begin_ingestion(chat_id):
             return
-        script_frame = _python_script_to_dataframe(accumulated_text)
-        if script_frame is not None:
-            user_sessions[chat_id] = {"df": script_frame, "timestamp": time.time()}
-            _send_ingestion_card(bot, message, script_frame, offer_download=True)
-            route = _multivariate_table_route(script_frame)
-            if route and route.get("kind") == "multivariate":
-                _prompt_multivariate(message, route)
-            else:
-                engine = _run_analysis(accumulated_text)
-                if engine.get("ok"):
-                    last_engine[chat_id] = engine
-                _send_analysis(bot, message, engine)
-            return
-        if _maybe_route_multivariate(message, accumulated_text):
-            return
-        frame = _read_delimited_frame(accumulated_text)
-        if frame is not None:
-            _send_ingestion_card(bot, message, frame, offer_download=True)
-        engine = _run_analysis(accumulated_text)
-        if engine.get("ok"):
-            last_engine[chat_id] = engine
-        _send_analysis(bot, message, engine)
+        try:
+            line_count = len([line for line in accumulated_text.splitlines() if line.strip()])
+            if line_count > 50:
+                bot.reply_to(
+                    message,
+                    "Tip: For large datasets (100+ rows), uploading as a .csv or .txt file avoids Telegram message splitting.",
+                )
+            if chat_id in pending_multivariate:
+                bot.reply_to(message, "Please finish the current column selection before sending another dataset.")
+                return
+            script_frame = _python_script_to_dataframe(accumulated_text)
+            if script_frame is not None:
+                script_frame = sanitize_incoming_dataframe(script_frame)
+                user_sessions[chat_id] = {"df": script_frame}
+                _send_ingestion_card(bot, message, script_frame, offer_download=True)
+                route = _multivariate_table_route(script_frame)
+                if route and route.get("kind") == "multivariate":
+                    _prompt_multivariate(message, route)
+                else:
+                    engine = _run_analysis(accumulated_text)
+                    if engine.get("ok"):
+                        last_engine[chat_id] = engine
+                    _send_analysis(bot, message, engine)
+                return
+            if _maybe_route_multivariate(message, accumulated_text):
+                return
+            frame = sanitize_incoming_dataframe(_read_delimited_frame(accumulated_text))
+            if frame is not None:
+                user_sessions[chat_id] = {"df": frame}
+                _send_ingestion_card(bot, message, frame, offer_download=True)
+            engine = _run_analysis(accumulated_text)
+            if engine.get("ok"):
+                last_engine[chat_id] = engine
+            _send_analysis(bot, message, engine)
+        finally:
+            _finish_ingestion(chat_id)
 
     def _flush_text_buffer(chat_id: int) -> None:
         with text_buffer_lock:
@@ -1251,8 +1444,18 @@ def main() -> None:
         chat_id = call.message.chat.id
         state = pending_multivariate.get(chat_id)
         if not state:
-            bot.answer_callback_query(call.id, "This dataset selection has expired.", show_alert=True)
-            return
+            session = user_sessions.get(chat_id)
+            if session and session.get("df") is not None:
+                route = _multivariate_table_route(session["df"])
+                if route and route.get("kind") == "multivariate":
+                    pending_multivariate[chat_id] = route
+                    state = route
+                else:
+                    bot.answer_callback_query(call.id, "No active selection is available. Please choose a new dataset or upload one again.", show_alert=True)
+                    return
+            else:
+                bot.answer_callback_query(call.id, "No active selection is available. Please choose a new dataset or upload one again.", show_alert=True)
+                return
         bot.answer_callback_query(call.id)
         callback_data = call.data or ""
         if ":" not in callback_data:
@@ -1335,6 +1538,32 @@ def main() -> None:
             if message.chat.id in pending_multivariate:
                 bot.reply_to(message, "Please finish the current column selection before sending another dataset.")
                 return
+            session = user_sessions.get(message.chat.id, {})
+            if isinstance(session, dict) and session.get("df") is not None and not session.get("ingesting_locked"):
+                conversational = _evaluate_conversational_query(message.chat.id, text)
+                if conversational is not None:
+                    if conversational["kind"] == "compare":
+                        factor = conversational["factor"]
+                        metric = conversational["metric"]
+                        frame = conversational["frame"].copy()
+                        ingested = _rebuild_ingested_from_frame(frame, factor, metric)
+                        engine = _analyze_ingested_safely(ingested, outcome_name=str(metric))
+                    else:
+                        frame = conversational["frame"].copy()
+                        engine = handle_analyze({"text": frame.to_csv(index=False), "outcome": conversational["y"] if conversational.get("y") else conversational.get("x")})
+                    if engine.get("ok"):
+                        last_engine[message.chat.id] = engine
+                    _send_analysis(bot, message, engine)
+                    return
+                if re.search(r"\b(compare|across|between|difference|predict|regression|anova|test)\b", text, flags=re.I):
+                    markup = _active_dataset_query_markup(session["df"])
+                    bot.reply_to(
+                        message,
+                        "I see your active dataset. Which factor and metric would you like to analyze? (e.g., 'Compare Transaction_Revenue across Region')",
+                        reply_markup=markup,
+                    )
+                    return
+                    
             if (
                 text.strip().upper() in {"YES", "YES4"}
                 and message.chat.id in last_engine
@@ -1367,6 +1596,10 @@ def main() -> None:
 
     @bot.message_handler(content_types=["document"])
     def on_document(message: Any) -> None:
+        if not _mark_message_processed(int(message.chat.id), getattr(message, "message_id", None)):
+            return
+        if not _begin_ingestion(message.chat.id):
+            return
         try:
             bot.reply_to(message, "Got it, reading your file…")
             document = message.document
@@ -1390,7 +1623,8 @@ def main() -> None:
                         except Exception:
                             frame = None
                     if frame is not None and not frame.empty:
-                        user_sessions[message.chat.id] = {"df": frame, "timestamp": time.time()}
+                        frame = sanitize_incoming_dataframe(frame)
+                        user_sessions[message.chat.id] = {"df": frame}
                         _send_ingestion_card(bot, message, frame, offer_download=True)
                     route = _multivariate_file_route(path)
                     if route and route["kind"] == "invalid":
@@ -1418,17 +1652,28 @@ def main() -> None:
                     return
         except Exception as exc:
             _send_error(bot, message, exc)
+        finally:
+            _finish_ingestion(message.chat.id)
 
     @bot.message_handler(content_types=["photo"])
     def on_photo(message: Any) -> None:
+        if not _mark_message_processed(int(message.chat.id), getattr(message, "message_id", None)):
+            return
+        if not _begin_ingestion(message.chat.id):
+            return
         try:
             bot.reply_to(message, "Got it, reading your file…")
             with tempfile.TemporaryDirectory(prefix="rowfirst-photo-") as tmp:
                 path = Path(tmp) / "photo.jpg"
                 info = bot.get_file(message.photo[-1].file_id)
                 path.write_bytes(bot.download_file(info.file_path))
-                table_text = _gemini_extract(path)
-                engine = handle_analyze({"text": _table_as_csv(table_text)})
+                table = _gemini_extract(path)
+                csv_text = _table_as_csv(table)
+                frame = sanitize_incoming_dataframe(_read_delimited_frame(csv_text))
+                if frame is not None:
+                    user_sessions[message.chat.id] = {"df": frame}
+                    _send_ingestion_card(bot, message, frame, offer_download=True)
+                engine = handle_analyze({"text": csv_text})
                 if engine.get("ok"):
                     last_engine[message.chat.id] = engine
                 _send_analysis(bot, message, engine)
@@ -1438,6 +1683,8 @@ def main() -> None:
                     bot.reply_to(message, "Choose your output format:", reply_markup=_output_selector_markup())
         except Exception as exc:
             _send_error(bot, message, exc, "Could not read the photo")
+        finally:
+            _finish_ingestion(message.chat.id)
 
     threading.Thread(
         target=_run_health_server,

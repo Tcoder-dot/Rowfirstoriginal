@@ -9,10 +9,22 @@ from typing import Any
 TITLE = "Results and statistical working"
 
 
+def _clean_document_text(text: str) -> str:
+    if not text:
+        return text
+    cleaned = text.strip()
+    cleaned = re.sub(r"\s*-\s*(?=[A-Z])", ": ", cleaned)
+    cleaned = re.sub(r"\s*-\s*(?=\d)", ": ", cleaned)
+    cleaned = re.sub(r"\s+[-–—]\s+", ", ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+,\s*", ", ", cleaned)
+    return cleaned
+
+
 def to_markdown(engine: dict[str, Any]) -> str:
     _require_engine(engine)
     results = _results(engine)
-    lines = [f"# {TITLE}", "", "## 1 Study and design", "", *_preamble(engine, results), ""]
+    lines = [f"# {_clean_document_text(TITLE)}", "", "## 1 Study and design", "", *[_clean_document_text(line) for line in _preamble(engine, results)], ""]
 
     raw_tables = _sample_preview(engine)
     lines.extend(["## 2 Raw data table", ""])
@@ -63,12 +75,12 @@ def write_docx(engine: dict[str, Any], path: str | Path) -> str:
     destination.parent.mkdir(parents=True, exist_ok=True)
     results = _results(engine)
     document = Document()
-    document.add_heading(TITLE, level=1)
+    document.add_heading(_clean_document_text(TITLE), level=1)
     document.add_paragraph("Compiled by Rowfirst Engine — 100% Deterministic SciPy Execution (Zero LLM Calculation Drift)")
     document.add_paragraph("Statistical analysis and working built from the verified engine JSON.")
     document.add_heading("1 Study and design", level=2)
     for paragraph in _preamble(engine, results):
-        document.add_paragraph(paragraph)
+        document.add_paragraph(_clean_document_text(paragraph))
 
     document.add_heading("2 Raw data table", level=2)
     raw_tables = _sample_preview(engine)
@@ -127,12 +139,12 @@ def write_pdf(engine: dict[str, Any], path: str | Path) -> str:
     styles.add(ParagraphStyle(name="RowfirstBody", parent=styles["BodyText"], alignment=TA_LEFT, leading=14))
     styles.add(ParagraphStyle(name="RowfirstSmall", parent=styles["BodyText"], alignment=TA_LEFT, fontSize=8, leading=10))
     story = [
-        Paragraph(_escape(TITLE), styles["Title"]),
+        Paragraph(_escape(_clean_document_text(TITLE)), styles["Title"]),
         Paragraph("Compiled by Rowfirst Engine — 100% Deterministic SciPy Execution (Zero LLM Calculation Drift)", styles["RowfirstBody"]),
         PageBreak(),
         Paragraph("1 Study and design", styles["Heading2"]),
     ]
-    story.extend(Paragraph(_escape(paragraph), styles["RowfirstBody"]) for paragraph in _preamble(engine, results))
+    story.extend(Paragraph(_escape(_clean_document_text(paragraph)), styles["RowfirstBody"]) for paragraph in _preamble(engine, results))
     story.extend([Spacer(1, 0.12 * inch), Paragraph("2 Raw data table", styles["Heading2"])])
     raw_tables = _sample_preview(engine)
     if raw_tables:
