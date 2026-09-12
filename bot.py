@@ -65,6 +65,9 @@ def _run_health_server() -> None:
     health_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 
+_GLOBAL_RESET_RE = re.compile(r"(?i)^(cancel|stop|abort|clear|start\s*over|reset|exit|quit|nevermind|back)$")
+
+
 _TABLE_FACTOR_NAMES = {
     "arm",
     "category",
@@ -146,28 +149,54 @@ def classify_columns(frame: pd.DataFrame | None) -> dict[str, list[str]]:
         if _is_temporal_or_datetime_column(frame, column):
             metadata_columns.append(str(column))
             continue
-        if pd.api.types.is_numeric_dtype(frame[column]):
-            numeric = pd.to_numeric(frame[column], errors="coerce")
-            if numeric.notna().sum() < max(2, int(len(frame) * 0.8)):
-                continue
-            if _is_binary_or_flag_numeric(frame[column]):
-                continue
-            numeric_metrics.append(str(column))
-        else:
-            series = frame[column].dropna().astype(str)
-            if series.empty:
-                continue
-            unique_count = int(series.nunique(dropna=True))
-            if unique_count > 1 and unique_count < len(frame):
+
+        series = frame[column]
+        numeric = pd.to_numeric(series, errors="coerce")
+        valid_numbers = numeric.dropna()
+
+        if valid_numbers.empty:
+            non_null = series.dropna()
+            if not non_null.empty and non_null.astype(str).nunique(dropna=True) > 1:
                 categorical_factors.append(str(column))
+            continue
+
+        if valid_numbers.size < max(2, int(len(frame) * 0.8)):
+            continue
+        if _is_binary_or_flag_numeric(series):
+            continue
+        if pd.api.types.is_float_dtype(series) or valid_numbers.apply(lambda x: not float(x).is_integer()).any():
+            numeric_metrics.append(str(column))
+            continue
+        if valid_numbers.nunique(dropna=True) <= 5:
+            categorical_factors.append(str(column))
+        else:
+            numeric_metrics.append(str(column))
+
     for column in list(frame.columns):
         name = str(column)
         if name in categorical_factors or name in numeric_metrics:
             continue
         if name in metadata_columns:
             continue
-        values = pd.to_numeric(frame[column], errors="coerce")
-        if values.notna().sum() >= max(2, int(len(frame) * 0.8)) and not _is_binary_or_flag_numeric(frame[column]):
+        series = frame[column]
+        numeric = pd.to_numeric(series, errors="coerce")
+        valid_numbers = numeric.dropna()
+
+        if valid_numbers.empty:
+            non_null = series.dropna()
+            if not non_null.empty and non_null.astype(str).nunique(dropna=True) > 1:
+                categorical_factors.append(name)
+            continue
+
+        if valid_numbers.size < max(2, int(len(frame) * 0.8)):
+            continue
+        if _is_binary_or_flag_numeric(series):
+            continue
+        if pd.api.types.is_float_dtype(series) or valid_numbers.apply(lambda x: not float(x).is_integer()).any():
+            numeric_metrics.append(name)
+        elif valid_numbers.nunique(dropna=True) <= 5:
+            categorical_factors.append(name)
+        else:
             numeric_metrics.append(name)
     return {
         "categorical_factors": list(dict.fromkeys(categorical_factors)),
@@ -835,6 +864,31 @@ def _save_dataset_artifacts(frame: pd.DataFrame, chat_id: int, prefix: str = "ro
     frame.to_csv(csv_path, index=False)
     frame.to_excel(xlsx_path, index=False)
     return csv_path, xlsx_path
+
+
+def _remember_active_dataset(chat_id: int, frame: pd.DataFrame | None, *, state: str = "ACTIVE_DATASET") -> None:
+    session = user_sessions.get(chat_id, {}) if isinstance(user_sessions.get(chat_id), dict) else {}
+    if frame is None:
+        session = {"state": "IDLE"}
+    else:
+        session["df"] = frame.copy()
+        session["active_df"] = frame.copy()
+        session["state"] = state
+    user_sessions[chat_id] = session
+
+
+def _handle_global_reset(bot: Any, message: Any) -> bool:
+    chat_id = int(getattr(message, "chat", None).id)
+    pending_multivariate.pop(chat_id, None)
+    pending_extracted.pop(chat_id, None)
+    last_engine.pop(chat_id, None)
+    user_sessions[chat_id] = {"state": "IDLE"}
+    try:
+        bot.edit_message_reply_markup(chat_id=chat_id, message_id=message.message_id, reply_markup=None)
+    except Exception:
+        pass
+    bot.reply_to(message, "🔄 Session reset. Active dataset and pending selections cleared. Send a new CSV, Excel, or PDF to begin.")
+    return True
 
 
 def _begin_ingestion(chat_id: int) -> bool:
@@ -1757,6 +1811,10 @@ def main() -> None:
         callback_data = call.data or ""
         sess = user_sessions.get(chat_id, {})
         bot.answer_callback_query(call.id)
+        try:
+            bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
         if callback_data == "meta:toggle":
             state = sess.get("assumption_context", {}) if isinstance(sess, dict) else {}
             frame = state.get("df") or sess.get("df")
@@ -1774,7 +1832,16 @@ def main() -> None:
             alt = _nonparametric_for_result(result, ingested)
             sess["state"] = "NONPARAMETRIC_FALLBACK"
             user_sessions[chat_id] = sess
-            bot.reply_to(call.message, "Non-parametric fallback result:\n" + json.dumps(alt, default=str)[:4000])
+            p_value = alt.get("p", 1.0)
+            statistic = alt.get("statistic", 0.0)
+            decision = "significant" if p_value < 0.05 else "not significant"
+            reply = (
+                "| Test | Statistic | p | Decision |\n"
+                "| --- | ---: | ---: | --- |\n"
+                f"| {alt.get('test', 'Kruskal-Wallis / Mann-Whitney')} | {float(statistic):.4f} | {_p(p_value)} | {decision} |\n\n"
+                f"The non-parametric check indicates {decision} evidence at α = .05."
+            )
+            bot.reply_to(call.message, reply)
             return
         if callback_data in {"assumption:standard", "choice:anova_override"}:
             sess["state"] = "ANOVA_OVERRIDE"
@@ -1808,10 +1875,10 @@ def main() -> None:
         chat_id = call.message.chat.id
         session = user_sessions.get(chat_id, {})
         frame = session.get("df") if isinstance(session, dict) else None
+        bot.answer_callback_query(call.id)
         if frame is None or frame.empty:
             bot.answer_callback_query(call.id, "No active dataset is loaded.", show_alert=True)
             return
-        bot.answer_callback_query(call.id)
         callback_data = call.data or ""
         if callback_data == "explore:back":
             session = user_sessions.get(chat_id, {}) if isinstance(user_sessions.get(chat_id), dict) else {}
@@ -1891,7 +1958,7 @@ def main() -> None:
             return
         frame = state["df"].copy()
         if callback_data == "extract:accept":
-            user_sessions[chat_id] = {"df": frame}
+            _remember_active_dataset(chat_id, frame)
             pending_extracted.pop(chat_id, None)
             _send_ingestion_card(bot, call.message, frame, offer_download=True)
             route = _multivariate_table_route(frame)
@@ -1965,7 +2032,7 @@ def main() -> None:
             script_frame = _python_script_to_dataframe(accumulated_text)
             if script_frame is not None:
                 script_frame = sanitize_incoming_dataframe(script_frame)
-                user_sessions[chat_id] = {"df": script_frame}
+                _remember_active_dataset(chat_id, script_frame)
                 _send_ingestion_card(bot, message, script_frame, offer_download=True)
                 route = _multivariate_table_route(script_frame)
                 if route and route.get("kind") == "multivariate":
@@ -1980,7 +2047,7 @@ def main() -> None:
                 return
             frame = sanitize_incoming_dataframe(_read_delimited_frame(accumulated_text))
             if frame is not None:
-                user_sessions[chat_id] = {"df": frame}
+                _remember_active_dataset(chat_id, frame)
                 _send_ingestion_card(bot, message, frame, offer_download=True)
             engine = _run_analysis(accumulated_text)
             if engine.get("ok"):
@@ -2128,6 +2195,9 @@ def main() -> None:
     def on_text(message: Any) -> None:
         try:
             text = message.text or ""
+            if _GLOBAL_RESET_RE.match(text.strip()):
+                _handle_global_reset(bot, message)
+                return
             if text.strip().startswith("/"):
                 return
             if _is_small_talk(text):
@@ -2288,7 +2358,7 @@ def main() -> None:
                             frame = None
                     if frame is not None and not frame.empty:
                         frame = sanitize_incoming_dataframe(frame)
-                        user_sessions[message.chat.id] = {"df": frame}
+                        _remember_active_dataset(message.chat.id, frame)
                         _send_ingestion_card(bot, message, frame, offer_download=True)
                     route = _multivariate_file_route(path)
                     if route and route["kind"] == "invalid":
