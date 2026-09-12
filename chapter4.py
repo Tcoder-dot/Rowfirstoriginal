@@ -377,12 +377,14 @@ def _raw_tables(engine: dict[str, Any]) -> list[tuple[str, list[str], list[tuple
             tables.append((parameter, ["Treatment", parameter], rows))
         return tables
     if fmt == "labelled":
+        factor_name = str(ingested.get("factor") or ingested.get("groupingVariable") or "Treatment")
+        metric_name = str(ingested.get("outcome") or ingested.get("metric") or "Value")
         rows = [
             (str(group["name"]), _raw_value(value))
             for group in ingested.get("groups", [])
             for value in group.get("values", [])
         ]
-        return [("", ["Treatment", "Value"], rows)]
+        return [("", [factor_name, metric_name], rows)]
     if fmt == "paired":
         headers = [str(ingested.get("id", "ID")), str(ingested.get("before", "Before")), str(ingested.get("after", "After"))]
         rows = [
@@ -960,7 +962,12 @@ def _fmt_sum(value: Any) -> str:
 
 
 def _fmt_p(value: Any) -> str:
-    return f"{float(value):.12g}" if isinstance(value, (int, float)) else "not reported"
+    if not isinstance(value, (int, float)):
+        return "not reported"
+    number = float(value)
+    if number < 0.001:
+        return "p < .001"
+    return f"p = {number:.4f}" if number < 1.0 else f"p = {number:.3f}"
 
 
 def _df(value: Any) -> str:

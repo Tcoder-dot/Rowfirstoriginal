@@ -24,8 +24,17 @@ import pandas as pd
 from flask import Flask
 from scipy import stats
 
+try:
+    from rapidfuzz import process as rapidfuzz_process
+except Exception:  # pragma: no cover
+    rapidfuzz_process = None
+
 from chapter4 import write_docx
 from charts import make_charts
+from data_explorer import (
+    run_explorer_action,
+    run_explorer_query,
+)
 from document_extractor import build_extraction_preview, extract_document_table, extract_structured_table
 from handle import analyze_ingested, build_breakdown, handle_analyze
 from ingest import ingest_file, ingest_text
@@ -91,6 +100,92 @@ _TABLE_ID_NAMES = {
 
 def _table_column_name(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
+
+
+def _column_title(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "Unnamed"
+    lowered = text.lower()
+    if re.search(r"(?i)(?:^|_)log(?:_|$)", text) and re.search(r"(?i)cfu", text):
+        return "log CFU/g"
+    if re.search(r"(?i)(?:^|_)log(?:_|$)", text):
+        text = re.sub(r"(?i)(?:^|_)(log)(?:_|$)", " log ", text)
+    if re.search(r"(?i)\b(?:pct|percent)\b|\(%\)$|_pct$|_percent$", text):
+        text = re.sub(r"(?i)\b(?:pct|percent)\b", "%", text)
+        text = re.sub(r"(?i)_pct$|_percent$", " (%)", text)
+        text = re.sub(r"\s*\(%\)\s*", " (%)", text)
+    if lowered.endswith("_g") or re.search(r"(?i)(?:^|_)(?:mg|g|kg|ml|l)(?:_|$)", text):
+        text = re.sub(r"(?i)_?(g|mg|kg|ml|l)(?:_|$)", lambda match: f" {match.group(1).upper()}", text)
+    text = text.replace("_", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\bcm\b", "cm", text, flags=re.I)
+    text = re.sub(r"\b(?:log|ln|sqrt)\b", lambda match: match.group(0).lower(), text, flags=re.I)
+    text = re.sub(r"\bCfU\b", "CFU", text, flags=re.I)
+    text = re.sub(r"\b(?:pct|percent)\b", "%", text, flags=re.I)
+    if re.search(r"(?i)\bCFU\b", text) and "CFU/g" not in text and "/g" not in text:
+        text = re.sub(r"(?i)\bCFU\b", "CFU/g", text)
+    if " (%)" not in text and re.search(r"(?i)\b(?:percent|pct)\b|\(%\)", text):
+        text = text.replace("%", " (%)")
+    text = re.sub(r"\s+\(\%\)", " (%)", text)
+    if text.lower().endswith("cfu/g"):
+        return text if "log" in text.lower() else f"{text}"
+    return text
+
+
+def classify_columns(frame: pd.DataFrame | None) -> dict[str, list[str]]:
+    if frame is None or frame.empty:
+        return {"categorical_factors": [], "numeric_metrics": [], "metadata_columns": []}
+    metadata_columns: list[str] = []
+    categorical_factors: list[str] = []
+    numeric_metrics: list[str] = []
+    for column in frame.columns:
+        if _is_metadata_only_column(frame, column) or _is_identifier_column(frame, column):
+            metadata_columns.append(str(column))
+            continue
+        if _is_temporal_or_datetime_column(frame, column):
+            metadata_columns.append(str(column))
+            continue
+        if pd.api.types.is_numeric_dtype(frame[column]):
+            numeric = pd.to_numeric(frame[column], errors="coerce")
+            if numeric.notna().sum() < max(2, int(len(frame) * 0.8)):
+                continue
+            if _is_binary_or_flag_numeric(frame[column]):
+                continue
+            numeric_metrics.append(str(column))
+        else:
+            series = frame[column].dropna().astype(str)
+            if series.empty:
+                continue
+            unique_count = int(series.nunique(dropna=True))
+            if unique_count > 1 and unique_count < len(frame):
+                categorical_factors.append(str(column))
+    for column in list(frame.columns):
+        name = str(column)
+        if name in categorical_factors or name in numeric_metrics:
+            continue
+        if name in metadata_columns:
+            continue
+        values = pd.to_numeric(frame[column], errors="coerce")
+        if values.notna().sum() >= max(2, int(len(frame) * 0.8)) and not _is_binary_or_flag_numeric(frame[column]):
+            numeric_metrics.append(name)
+    return {
+        "categorical_factors": list(dict.fromkeys(categorical_factors)),
+        "numeric_metrics": list(dict.fromkeys(numeric_metrics)),
+        "metadata_columns": list(dict.fromkeys(metadata_columns)),
+    }
+
+
+def _coerce_p_value_text(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "not reported"
+    if number < 0.001:
+        return "p < .001"
+    if number >= 1.0:
+        return f"p = {number:.3f}"
+    return f"p = {number:.4f}"
 
 
 def _read_delimited_frame(raw_text: str) -> pd.DataFrame | None:
@@ -247,70 +342,134 @@ def _is_valid_continuous_outcome(series: pd.Series) -> bool:
     return bool(np.isfinite(variance) and variance > 0.0)
 
 
+def _is_metadata_only_column(frame: pd.DataFrame, column: str) -> bool:
+    if column not in frame.columns:
+        return False
+    normalized = _table_column_name(column)
+    if re.fullmatch(r"(?i)(index|row_id|id|s/n|sn|record_id|customer_id|user_id|order_id|case_id|lead_id)", normalized):
+        return True
+    series = frame[column].dropna()
+    if series.empty:
+        return False
+    try:
+        numeric = pd.to_numeric(series, errors="coerce")
+    except Exception:
+        numeric = pd.Series([], dtype=float)
+    if numeric.empty:
+        return False
+    if numeric.notna().sum() != len(series):
+        return False
+    if not (numeric % 1 == 0).all():
+        return False
+    expected = list(range(1, len(series) + 1))
+    actual = [int(value) for value in numeric.astype(int).tolist()]
+    return actual == expected or actual == list(range(0, len(series)))
+
+
+def _is_temporal_metric_series(series: pd.Series) -> bool:
+    if series.empty:
+        return False
+    text = series.dropna().astype(str)
+    if text.empty:
+        return False
+    date_pattern = r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|Q[1-4]\s*\d{2,4}|\d{4}Q[1-4]|\d{2}:\d{2}|T\d{2}:\d{2}"
+    if text.str.contains(date_pattern, case=False, regex=True).any():
+        return True
+    numeric = pd.to_numeric(series, errors="coerce").dropna()
+    if numeric.empty:
+        return False
+    return bool(numeric.between(40000, 60000).all() and len(numeric) >= max(1, int(len(series) * 0.8)))
+
+
+def _column_is_factor_candidate(frame: pd.DataFrame, column: str) -> bool:
+    if column not in frame.columns:
+        return False
+    if _is_metadata_only_column(frame, column):
+        return False
+    if _is_temporal_or_datetime_column(frame, column):
+        return False
+    if _is_identifier_column(frame, column):
+        return False
+    if pd.api.types.is_numeric_dtype(frame[column]):
+        series = frame[column].dropna()
+        if series.empty:
+            return False
+        values = pd.to_numeric(series, errors="coerce")
+        if values.empty:
+            return False
+        if values.nunique(dropna=True) <= 2 and values.isin([0, 1]).all():
+            return False
+        return False
+    series = frame[column].dropna().astype(str)
+    if series.empty:
+        return False
+    unique_count = int(series.nunique(dropna=True))
+    return 1 < unique_count < len(frame)
+
+
+def _column_is_numeric_metric_candidate(frame: pd.DataFrame, column: str) -> bool:
+    if column not in frame.columns:
+        return False
+    if _is_metadata_only_column(frame, column):
+        return False
+    if _is_temporal_or_datetime_column(frame, column):
+        return False
+    if _is_identifier_column(frame, column):
+        return False
+    if _is_binary_or_flag_numeric(frame[column]):
+        return False
+    cleaned = frame[column].map(_clean_currency_like_cell)
+    coerced = pd.to_numeric(cleaned, errors="coerce")
+    valid = coerced.notna()
+    if valid.sum() < max(2, int(len(frame) * 0.8)):
+        return False
+    if coerced.dropna().nunique(dropna=True) <= 1:
+        return False
+    return True
+
+
 def _multivariate_table_route(frame: pd.DataFrame | None) -> dict[str, Any] | None:
     """Classify a table before it enters the existing ingestion/engine path."""
     if frame is None or frame.shape[1] < 2:
         return None
-    numeric_columns = [column for column in _numeric_table_columns(frame) if not _is_identifier_column(frame, column)]
-    numeric_set = set(numeric_columns)
-    identifier_columns = [column for column in frame.columns if _is_identifier_column(frame, column)]
+    metadata_columns = [column for column in frame.columns if _is_metadata_only_column(frame, column)]
     temporal_columns = [column for column in frame.columns if _is_temporal_or_datetime_column(frame, column)]
-    factor_columns: list[str] = [
+    factor_columns = [
         column for column in frame.columns
-        if column not in numeric_set and column not in identifier_columns and column not in temporal_columns
+        if column not in metadata_columns and column not in temporal_columns and _column_is_factor_candidate(frame, column)
     ]
-    for column in numeric_columns:
-        normalized = _table_column_name(column)
-        values = pd.to_numeric(frame[column], errors="coerce").dropna()
-        integer_like = bool(values.size) and bool((values % 1 == 0).all())
-        low_cardinality = values.nunique() >= 2 and values.nunique() <= min(12, max(3, len(frame) // 3))
-        if _is_binary_or_flag_numeric(frame[column]):
-            continue
-        elif normalized in _TABLE_FACTOR_NAMES or (integer_like and low_cardinality and normalized.endswith("time")):
-            factor_columns.append(column)
+    outcome_columns = [
+        column for column in frame.columns
+        if column not in metadata_columns and column not in temporal_columns and _column_is_numeric_metric_candidate(frame, column)
+    ]
 
-    # A conventional two-column Treatment/Value table already has an
-    # existing ingestion path and should not be diverted to a prompt.
+    if not factor_columns or not outcome_columns:
+        return {
+            "kind": "needs_mapping",
+            "frame": frame,
+            "factors": list(dict.fromkeys(factor_columns)),
+            "outcomes": list(dict.fromkeys(outcome_columns)),
+            "columns": list(frame.columns),
+            "message": (
+                "We could not automatically detect your grouping factor or outcome metric. "
+                "Please manually map your columns:"
+            ),
+        }
+
     normalized_headers = {_table_column_name(column) for column in frame.columns}
     if (
         len(frame.columns) == 2
         and normalized_headers & {"group", "method", "treatment", "condition"}
-        and len(numeric_columns) == 1
+        and len(outcome_columns) == 1
     ):
         return None
 
-    outcome_columns = [
-        column for column in numeric_columns
-        if column not in factor_columns
-        and column not in temporal_columns
-        and not _is_binary_or_flag_numeric(frame[column])
-        and _is_valid_continuous_outcome(frame[column])
-    ]
-    if not outcome_columns:
-        outcome_columns = [
-            column for column in numeric_columns
-            if column not in factor_columns and column not in temporal_columns and not _is_binary_or_flag_numeric(frame[column])
-        ]
-    if factor_columns and outcome_columns:
-        return {
-            "kind": "multivariate",
-            "frame": frame,
-            "factors": list(dict.fromkeys(factor_columns)),
-            "outcomes": outcome_columns,
-        }
-
-    if len(numeric_columns) >= 2 and not factor_columns:
-        counts = [int(pd.to_numeric(frame[column], errors="coerce").notna().sum()) for column in numeric_columns]
-        if any(count < 2 for count in counts):
-            return {
-                "kind": "invalid",
-                "message": (
-                    "I found numeric groups with only one observation. "
-                    "ANOVA needs at least two observations per group, so I stopped without generating a report."
-                ),
-            }
-        return {"kind": "wide", "frame": frame}
-    return None
+    return {
+        "kind": "multivariate",
+        "frame": frame,
+        "factors": list(dict.fromkeys(factor_columns)),
+        "outcomes": list(dict.fromkeys(outcome_columns)),
+    }
 
 
 def _group_size_error(ingested: dict[str, Any]) -> str | None:
@@ -469,7 +628,11 @@ def _build_data_health_profile(frame: pd.DataFrame | None) -> dict[str, Any]:
     }
 
 
-def _format_data_health_card(profile: dict[str, Any]) -> str:
+def _format_data_health_card(profile: dict[str, Any], categorical_factors: list[str] | None = None, numeric_metrics: list[str] | None = None) -> str:
+    factor_names = list(dict.fromkeys(categorical_factors or profile.get("categorical_factors", [])))
+    metric_names = list(dict.fromkeys(numeric_metrics or profile.get("numeric_metrics", [])))
+    factor_lines = [f"- {_column_title(name)}" for name in factor_names] if factor_names else ["- None detected"]
+    metric_lines = [f"- {_column_title(name)}" for name in metric_names] if metric_names else ["- None detected"]
     lines = [
         "Data Health Card",
         "Data Ingestion Card",
@@ -484,10 +647,10 @@ def _format_data_health_card(profile: dict[str, Any]) -> str:
         f"- Duplicate Rows: {profile.get('duplicate_rows', 0)}",
         "",
         "Detected Categorical Factors:",
-        *([f"- {item['column']}: {item['missing']} missing values" for item in profile.get('missing_by_column', [])[:5]] or ["- None detected"]),
+        *factor_lines,
         "",
         "Detected Numeric Metrics:",
-        *([f"- {item['column']}: completeness {item['completeness']:.1f}%" for item in profile.get('missing_by_column', [])[:5]] or ["- None detected"]),
+        *metric_lines,
         "",
         "Missing Values / Data Health:",
         f"- Missing cells: {profile.get('missing_total', 0)} total",
@@ -509,8 +672,11 @@ def _format_data_health_card(profile: dict[str, Any]) -> str:
 
 
 def _summarize_dataframe(frame: pd.DataFrame) -> str:
+    classified = classify_columns(frame)
     profile = _build_data_health_profile(frame)
-    return _format_data_health_card(profile)
+    profile["categorical_factors"] = classified["categorical_factors"]
+    profile["numeric_metrics"] = classified["numeric_metrics"]
+    return _format_data_health_card(profile, classified["categorical_factors"], classified["numeric_metrics"])
 
 
 def _safe_python_globals() -> dict[str, Any]:
@@ -618,13 +784,48 @@ def _assumption_failure(engine: dict[str, Any]) -> bool:
     for result in results:
         assumptions = result.get("assumptions") or {}
         levene = assumptions.get("levene") or {}
-        if isinstance(levene, dict) and levene.get("p") is not None and levene.get("p") < 0.05:
+        levene_p = levene.get("p") if isinstance(levene, dict) else None
+        if levene_p is not None and levene_p < 0.05:
             return True
+        shapiro_values = []
         for item in assumptions.get("shapiroWilk", []) or []:
             p_value = item.get("p")
-            if p_value is not None and p_value < 0.05:
-                return True
+            if p_value is not None:
+                shapiro_values.append(float(p_value))
+        if any(p < 0.05 for p in shapiro_values):
+            return True
+        if any(result.get("test") == "one-way anova" and isinstance(result.get("p"), (int, float)) and result["p"] < 0.05 for result in [result]):
+            continue
     return False
+
+
+def _assumption_violation(engine: dict[str, Any]) -> bool:
+    if not engine or not engine.get("ok"):
+        return False
+    results = engine.get("results") or [engine.get("result")]
+    for result in results:
+        assumptions = result.get("assumptions") or {}
+        levene = assumptions.get("levene") or {}
+        levene_p = levene.get("p") if isinstance(levene, dict) else None
+        if levene_p is not None and levene_p < 0.05:
+            return True
+        shapiro_values = []
+        for item in assumptions.get("shapiroWilk", []) or []:
+            p_value = item.get("p")
+            if p_value is not None:
+                shapiro_values.append(float(p_value))
+        if any(p < 0.05 for p in shapiro_values):
+            return True
+    return False
+
+
+def _cache_assumption_state(session: dict[str, Any], frame: pd.DataFrame | None, factor: str | None, metric: str | None) -> None:
+    session["state"] = "AWAITING_ASSUMPTION_CHOICE"
+    session["assumption_context"] = {
+        "df": frame.copy() if isinstance(frame, pd.DataFrame) else None,
+        "factor": factor,
+        "metric": metric,
+    }
 
 
 def _save_dataset_artifacts(frame: pd.DataFrame, chat_id: int, prefix: str = "rowfirst") -> tuple[Path, Path]:
@@ -688,12 +889,40 @@ def _mark_message_processed(chat_id: int, message_id: int | None) -> bool:
     return True
 
 
+def _explore_dataset_markup() -> Any:
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("🔍 Explore Dataset Insights", callback_data="explore:dataset"))
+    return markup
+
+
+def _explorer_mode_markup() -> Any:
+    if types is None:
+        return None
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("🏆 Top & Bottom Performers", callback_data="explore:top_bottom"),
+        types.InlineKeyboardButton("📊 Key Metrics & Distribution", callback_data="explore:key_metrics"),
+        types.InlineKeyboardButton("🔗 Strongest Correlations", callback_data="explore:correlations"),
+        types.InlineKeyboardButton("❓ Ask a Question", callback_data="explore:question"),
+        types.InlineKeyboardButton("🔙 Back to Analysis", callback_data="explore:back"),
+    )
+    return markup
+
+
+def _explorer_back_markup() -> Any:
+    if types is None:
+        return None
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("🔙 Back to Analysis", callback_data="explore:back"))
+    return markup
+
+
 def _send_ingestion_card(bot: Any, message: Any, frame: pd.DataFrame, *, offer_download: bool = True) -> None:
     message_id = getattr(message, "message_id", None)
     if not _mark_message_processed(int(message.chat.id), message_id):
         return
     summary = _normalize_copy_text(_summarize_dataframe(frame))
-    bot.reply_to(message, summary[:4000])
+    bot.reply_to(message, summary[:4000], reply_markup=_explore_dataset_markup())
     if offer_download:
         csv_path, xlsx_path = _save_dataset_artifacts(frame, int(message.chat.id))
         with open(csv_path, "rb") as csv_file:
@@ -747,8 +976,19 @@ def _singleton_triage_markup() -> Any:
 def _assumption_markup() -> Any:
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
-        types.InlineKeyboardButton("Run Kruskal-Wallis / Mann-Whitney", callback_data="assumption:nonparametric"),
-        types.InlineKeyboardButton("Proceed with Standard ANOVA / t-Test", callback_data="assumption:standard"),
+        types.InlineKeyboardButton("Run Kruskal-Wallis / Mann-Whitney", callback_data="choice:kruskal"),
+        types.InlineKeyboardButton("Proceed with Standard ANOVA", callback_data="choice:anova_override"),
+    )
+    return markup
+
+
+def _manual_mapping_markup(frame: pd.DataFrame | None) -> Any:
+    if frame is None or frame.empty:
+        return None
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("Select Factor (Independent)", callback_data="manualmap:factor"),
+        types.InlineKeyboardButton("Select Metric (Dependent)", callback_data="manualmap:metric"),
     )
     return markup
 
@@ -1306,7 +1546,9 @@ def _p(value: Any) -> str:
         number = float(value)
     except (TypeError, ValueError):
         return "not reported"
-    return "< .001" if number < 0.001 else f"{number:.4f}"
+    if number < 0.001:
+        return "p < .001"
+    return f"p = {number:.4f}" if number < 1 else f"p = {number:.4f}"
 
 
 def main() -> None:
@@ -1404,7 +1646,7 @@ def main() -> None:
             ),
         )
 
-    def _choice_markup(prefix: str, choices: list[str]) -> Any:
+    def _choice_markup(prefix: str, choices: list[str], *, include_metadata_toggle: bool = False) -> Any:
         markup = types.InlineKeyboardMarkup(row_width=2)
         markup.add(*[
             types.InlineKeyboardButton(
@@ -1413,7 +1655,18 @@ def main() -> None:
             )
             for choice in choices
         ])
+        if include_metadata_toggle:
+            markup.add(types.InlineKeyboardButton("+ Show Excluded / Metadata Columns", callback_data="meta:toggle"))
         return markup
+
+    def _metadata_choice_markup(frame: pd.DataFrame, prefix: str, *, include_excluded: bool = False) -> Any:
+        options = [column for column in frame.columns if _is_identifier_column(frame, column) or _is_temporal_or_datetime_column(frame, column)]
+        if not options:
+            return _choice_markup(prefix, [column for column in frame.columns if column and not _is_identifier_column(frame, column)], include_metadata_toggle=False)
+        choices = [column for column in frame.columns if column and not _is_identifier_column(frame, column)]
+        if include_excluded:
+            choices = [f"{column} (⚠️ High Cardinality / ID)" if _is_identifier_column(frame, column) or _is_temporal_or_datetime_column(frame, column) else column for column in frame.columns]
+        return _choice_markup(prefix, choices, include_metadata_toggle=True)
 
     def _prompt_multivariate(
         message: Any,
@@ -1498,12 +1751,20 @@ def main() -> None:
             return
         bot.answer_callback_query(call.id, "Unknown singleton option.", show_alert=True)
 
-    @bot.callback_query_handler(func=lambda call: (getattr(call, "data", "") or "").startswith("assumption:"))
+    @bot.callback_query_handler(func=lambda call: (getattr(call, "data", "") or "").startswith(("assumption:", "choice:", "meta:")))
     def on_assumption_decision(call: Any) -> None:
         chat_id = call.message.chat.id
         callback_data = call.data or ""
+        sess = user_sessions.get(chat_id, {})
         bot.answer_callback_query(call.id)
-        if callback_data == "assumption:nonparametric":
+        if callback_data == "meta:toggle":
+            state = sess.get("assumption_context", {}) if isinstance(sess, dict) else {}
+            frame = state.get("df") or sess.get("df")
+            if frame is not None and not frame.empty:
+                options = [column for column in frame.columns if column and (not _is_identifier_column(frame, column) or _is_temporal_or_datetime_column(frame, column))]
+                bot.reply_to(call.message, "Excluded / metadata columns are marked explicitly below:", reply_markup=_choice_markup("factor", [f"{column} (⚠️ High Cardinality / ID)" if _is_identifier_column(frame, column) else column for column in options], include_metadata_toggle=False))
+            return
+        if callback_data in {"assumption:nonparametric", "choice:kruskal"}:
             engine = last_engine.get(chat_id)
             if not engine:
                 bot.reply_to(call.message, "No test result is active for this session.")
@@ -1511,12 +1772,102 @@ def main() -> None:
             result = engine.get("result") or (engine.get("results") or [{}])[0]
             ingested = engine.get("ingested") or {}
             alt = _nonparametric_for_result(result, ingested)
+            sess["state"] = "NONPARAMETRIC_FALLBACK"
+            user_sessions[chat_id] = sess
             bot.reply_to(call.message, "Non-parametric fallback result:\n" + json.dumps(alt, default=str)[:4000])
             return
-        if callback_data == "assumption:standard":
+        if callback_data in {"assumption:standard", "choice:anova_override"}:
+            sess["state"] = "ANOVA_OVERRIDE"
+            user_sessions[chat_id] = sess
             bot.reply_to(call.message, "Proceeding with the standard test. The original SciPy calculation remains the source of truth.")
             return
         bot.answer_callback_query(call.id, "Unknown assumption decision.", show_alert=True)
+
+    @bot.callback_query_handler(func=lambda call: (getattr(call, "data", "") or "").startswith("manualmap:"))
+    def on_manual_mapping(call: Any) -> None:
+        chat_id = call.message.chat.id
+        session = user_sessions.get(chat_id)
+        if not session or session.get("df") is None:
+            bot.answer_callback_query(call.id, "No active dataset is loaded. Please upload or paste one first.", show_alert=True)
+            return
+        frame = session["df"]
+        callback_data = call.data or ""
+        bot.answer_callback_query(call.id)
+        if callback_data == "manualmap:factor":
+            options = [column for column in frame.columns if not _is_metadata_only_column(frame, column)]
+            bot.reply_to(call.message, "Select the Grouping Factor (Independent Variable):", reply_markup=_choice_markup("factor", options))
+            return
+        if callback_data == "manualmap:metric":
+            options = [column for column in frame.columns if not _is_metadata_only_column(frame, column)]
+            bot.reply_to(call.message, "Select the Outcome Metric (Dependent Variable):", reply_markup=_choice_markup("outcome", options))
+            return
+        bot.answer_callback_query(call.id, "Unknown manual-mapping selection.", show_alert=True)
+
+    @bot.callback_query_handler(func=lambda call: (getattr(call, "data", "") or "").startswith("explore:"))
+    def on_explore_dataset(call: Any) -> None:
+        chat_id = call.message.chat.id
+        session = user_sessions.get(chat_id, {})
+        frame = session.get("df") if isinstance(session, dict) else None
+        if frame is None or frame.empty:
+            bot.answer_callback_query(call.id, "No active dataset is loaded.", show_alert=True)
+            return
+        bot.answer_callback_query(call.id)
+        callback_data = call.data or ""
+        if callback_data == "explore:back":
+            session = user_sessions.get(chat_id, {}) if isinstance(user_sessions.get(chat_id), dict) else {}
+            session["state"] = "ACTIVE_DATASET"
+            session.pop("explore_prompt", None)
+            user_sessions[chat_id] = session
+            bot.reply_to(call.message, "Back in the main analysis flow. You can continue with standard statistics or upload another dataset.")
+            return
+        if callback_data == "explore:dataset":
+            session["state"] = "EXPLORER_MODE"
+            user_sessions[chat_id] = {**session, "explore_prompt": False}
+            bot.reply_to(
+                call.message,
+                "Explore mode is active. Choose an insight or ask me a direct question about the current dataset.",
+                reply_markup=_explorer_mode_markup(),
+            )
+            return
+        if callback_data == "explore:question":
+            session["state"] = "EXPLORER_MODE"
+            user_sessions[chat_id] = {**session, "explore_prompt": True}
+            bot.reply_to(
+                call.message,
+                "Type a question like 'highest sales by region' or 'average moisture'.",
+                reply_markup=_explorer_back_markup(),
+            )
+            return
+        if callback_data == "explore:top_bottom":
+            try:
+                summary = run_explorer_action(frame, "top_bottom")
+            except Exception as exc:
+                summary = str(exc)
+            session["state"] = "EXPLORER_MODE"
+            user_sessions[chat_id] = session
+            bot.reply_to(call.message, summary, reply_markup=_explorer_back_markup())
+            return
+        if callback_data == "explore:key_metrics":
+            try:
+                summary = run_explorer_action(frame, "key_metrics")
+            except Exception as exc:
+                summary = str(exc)
+            session["state"] = "EXPLORER_MODE"
+            user_sessions[chat_id] = session
+            bot.reply_to(call.message, summary, reply_markup=_explorer_back_markup())
+            return
+        if callback_data == "explore:correlations":
+            try:
+                summary = run_explorer_action(frame, "correlations")
+            except Exception as exc:
+                summary = str(exc)
+            session["state"] = "EXPLORER_MODE"
+            user_sessions[chat_id] = session
+            bot.reply_to(call.message, summary, reply_markup=_explorer_back_markup())
+            return
+        session["state"] = "EXPLORER_MODE"
+        user_sessions[chat_id] = {**session, "explore_prompt": True}
+        bot.reply_to(call.message, "Send a quick query like: 'highest Revenue by Region' or 'average log_CFU_g'.", reply_markup=_explorer_back_markup())
 
     @bot.callback_query_handler(func=lambda call: (getattr(call, "data", "") or "").startswith("output:"))
     def on_output_selection(call: Any) -> None:
@@ -1565,6 +1916,14 @@ def main() -> None:
             return False
         if route["kind"] == "invalid":
             bot.reply_to(message, route["message"])
+            return True
+        if route["kind"] == "needs_mapping":
+            user_sessions[message.chat.id] = {"df": route["frame"]}
+            bot.reply_to(
+                message,
+                route["message"],
+                reply_markup=_manual_mapping_markup(route["frame"]),
+            )
             return True
         if route["kind"] == "multivariate":
             _prompt_multivariate(message, route)
@@ -1754,6 +2113,13 @@ def main() -> None:
         if engine.get("ok"):
             last_engine[chat_id] = engine
             _send_analysis(bot, call.message, engine, ask_for_document=False)
+            if _assumption_violation(engine):
+                session = user_sessions.get(chat_id, {})
+                if isinstance(session, dict):
+                    _cache_assumption_state(session, frame, chosen_factor, chosen_outcome)
+                    user_sessions[chat_id] = session
+                bot.reply_to(call.message, "Assumptions violated: Proceed with standard test or run non-parametric alternative?", reply_markup=_assumption_markup())
+                return
             send_results_document(call.message)
         else:
             _send_analysis(bot, call.message, engine)
@@ -1775,6 +2141,17 @@ def main() -> None:
                 return
             session = user_sessions.get(message.chat.id, {})
             if isinstance(session, dict) and session.get("df") is not None and not session.get("ingesting_locked"):
+                if session.get("explore_prompt") or session.get("state") == "EXPLORER_MODE":
+                    frame = session["df"]
+                    try:
+                        summary = run_explorer_query(frame, text)
+                    except Exception as exc:
+                        summary = str(exc)
+                    bot.reply_to(message, summary, reply_markup=_explorer_back_markup())
+                    session["explore_prompt"] = False
+                    session["state"] = "EXPLORER_MODE"
+                    user_sessions[message.chat.id] = session
+                    return
                 conversational = _evaluate_conversational_query(message.chat.id, text)
                 if conversational is not None:
                     if conversational["kind"] == "compare":
@@ -1823,11 +2200,63 @@ def main() -> None:
                 last_engine[message.chat.id] = engine
             _send_analysis(bot, message, engine)
             if _assumption_failure(engine):
+                session = user_sessions.get(message.chat.id, {})
+                if isinstance(session, dict):
+                    _cache_assumption_state(session, session.get("df"), session.get("factor"), session.get("metric"))
+                    user_sessions[message.chat.id] = session
                 bot.reply_to(message, "Assumptions violated: Proceed with standard test or run non-parametric alternative?", reply_markup=_assumption_markup())
-            else:
-                bot.reply_to(message, "Choose your output format:", reply_markup=_output_selector_markup())
+                return
+            bot.reply_to(message, "Choose your output format:", reply_markup=_output_selector_markup())
         except Exception as exc:
             _send_error(bot, message, exc, "Could not analyse that")
+
+    def _dataset_explore_summary(frame: pd.DataFrame, query: str) -> str:
+        if frame is None or frame.empty:
+            return "No dataset is active for exploration."
+        match = _match_dataset_columns(frame, query)
+        if not match:
+            return "I can answer quick queries like 'average Revenue', 'highest Revenue by Region', or 'mean score'."
+        metric_name, factor_name, aggregation = match
+        if aggregation == "average":
+            if factor_name:
+                grouped = frame.groupby(factor_name, dropna=False)[metric_name].mean().sort_values(ascending=False)
+                if grouped.empty:
+                    return f"No valid data was available for {metric_name} by {factor_name}."
+                top = grouped.head(3)
+                return f"Average {metric_name} by {factor_name}: " + "; ".join(f"{label} = {value:.3f}" for label, value in top.items()) + "."
+            return f"Average {metric_name} = {frame[metric_name].mean():.3f}."
+        if factor_name:
+            grouped = frame.groupby(factor_name, dropna=False)[metric_name].mean().sort_values(ascending=False)
+            if grouped.empty:
+                return f"No valid data was available for {metric_name} by {factor_name}."
+            best_name, best_value = grouped.iloc[0]
+            return f"Highest average {metric_name} by {factor_name}: {best_name} = {best_value:.3f}."
+        return f"{metric_name} summary: mean = {frame[metric_name].mean():.3f}, median = {frame[metric_name].median():.3f}."
+
+    def _match_dataset_columns(frame: pd.DataFrame, query: str) -> tuple[str, str | None, str] | None:
+        text = str(query or "").lower()
+        if not text:
+            return None
+        if rapidfuzz_process is not None:
+            metric_candidates = [column for column in frame.columns if not _is_identifier_column(frame, column) and not _is_temporal_or_datetime_column(frame, column)]
+            query_terms = re.findall(r"[a-zA-Z0-9_\- ]+", text)
+            for candidate in metric_candidates:
+                score = rapidfuzz_process.fuzz.ratio(str(candidate).lower(), " ".join(query_terms))
+                if score > 60:
+                    metric_name = candidate
+                    break
+            else:
+                metric_name = None
+        else:
+            metric_name = _column_lookup(frame, text)
+        if metric_name is None:
+            return None
+        factor_name = None
+        if re.search(r"by\s+([a-z0-9_\- ]+)", text):
+            factor_candidate = re.search(r"by\s+([a-z0-9_\- ]+)", text).group(1)
+            factor_name = _column_lookup(frame, factor_candidate)
+        aggregation = "average" if re.search(r"(?:average|mean|avg)", text) else "highest" if re.search(r"(?:highest|top|max|largest)", text) else "average"
+        return metric_name, factor_name, aggregation
 
     @bot.message_handler(content_types=["document"])
     def on_document(message: Any) -> None:
@@ -1873,9 +2302,13 @@ def main() -> None:
                         last_engine[message.chat.id] = engine
                     _send_analysis(bot, message, engine)
                     if _assumption_failure(engine):
+                        session = user_sessions.get(message.chat.id, {})
+                        if isinstance(session, dict):
+                            _cache_assumption_state(session, session.get("df"), session.get("factor"), session.get("metric"))
+                            user_sessions[message.chat.id] = session
                         bot.reply_to(message, "Assumptions violated: Proceed with standard test or run non-parametric alternative?", reply_markup=_assumption_markup())
-                    else:
-                        bot.reply_to(message, "Choose your output format:", reply_markup=_output_selector_markup())
+                        return
+                    bot.reply_to(message, "Choose your output format:", reply_markup=_output_selector_markup())
                     return
                 if suffix in GEMINI_SUFFIXES:
                     frame = extract_structured_table(path)

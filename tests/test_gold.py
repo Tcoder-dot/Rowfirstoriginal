@@ -19,7 +19,10 @@ from bot import (
     _python_script_to_dataframe,
     _summarize_dataframe,
     _singleton_groups_for_frame,
+    classify_columns,
+    _coerce_p_value_text,
 )
+from data_explorer import run_explorer_action, run_explorer_query
 from PIL import Image
 from docx import Document
 
@@ -197,6 +200,25 @@ def variable_classification_regressions():
     return fails
 
 
+def dataset1_guard_regressions():
+    fails = []
+    dataset1 = pd.DataFrame({
+        "Index": [1, 2, 3, 4, 5, 6],
+        "Company_Name": ["Acme", "Beta", "Acme", "Gamma", "Beta", "Gamma"],
+        "Created_Date": ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05", "2024-01-06", "2024-01-07"],
+        "Renewal_Date": ["2024-02-01", "2024-02-02", "2024-02-03", "2024-02-04", "2024-02-05", "2024-02-06"],
+        "Lead_Score": [61, 68, 72, 79, 74, 88],
+    })
+    route = _multivariate_table_route(dataset1)
+    if route is None:
+        fails.append("Dataset 1 should halt to manual mapping rather than returning None")
+    elif route.get("kind") != "needs_mapping":
+        fails.append(f"Dataset 1 should require manual mapping, got {route!r}")
+    elif set(route.get("factors", [])) != {"Company_Name"}:
+        fails.append(f"Dataset 1 factor candidate detection failed: {route.get('factors')!r}")
+    return fails
+
+
 def data_health_regressions():
     fails = []
 
@@ -273,6 +295,63 @@ def document_narrative_regressions():
                 fails.append("DOCX output still contains generic placeholder text")
             if "total viable count" not in xml and "total viable count (log cfu/g)" not in xml:
                 fails.append("DOCX narrative did not include the cleaned variable label")
+    return fails
+
+
+def assumption_and_ingestion_regressions():
+    fails = []
+
+    df = pd.DataFrame({
+        "Patient_ID": [1, 2, 3, 4, 5, 6],
+        "Treatment": ["A", "A", "B", "B", "C", "C"],
+        "log_CFU_g": [2.0, 2.1, 6.5, 6.9, 10.1, 9.8],
+        "Moisture_pct": [12.0, 13.5, 18.0, 18.1, 25.4, 26.0],
+    })
+    classified = classify_columns(df)
+    if set(classified["categorical_factors"]) != {"Treatment"}:
+        fails.append(f"categorical factors misclassified: {classified['categorical_factors']}")
+    if set(classified["numeric_metrics"]) != {"log_CFU_g", "Moisture_pct"}:
+        fails.append(f"numeric metrics misclassified: {classified['numeric_metrics']}")
+
+    summary = _summarize_dataframe(df)
+    if "Detected Categorical Factors" not in summary or "Detected Numeric Metrics" not in summary:
+        fails.append("ingestion card did not show dynamic factor and metric sections")
+    if "Treatment" not in summary or "log CFU/g" not in summary:
+        fails.append(f"dynamic ingestion summary missed detected columns: {summary}")
+
+    formatted = _coerce_p_value_text(8.1038e-131)
+    if formatted != "p < .001":
+        fails.append(f"p-value formatter returned {formatted!r}, expected 'p < .001'")
+    return fails
+
+
+def explorer_regressions():
+    fails = []
+    frame = pd.DataFrame({
+        "Region": ["North", "North", "South", "South", "East", "East"],
+        "Revenue": [1200, 1400, 900, 950, 1100, 1300],
+        "Moisture_pct": [10.0, 12.0, 8.0, 9.0, 11.0, 13.0],
+    })
+
+    action = run_explorer_action(frame, "top_bottom")
+    if "North" not in action or "highest" not in action.lower():
+        fails.append(f"top-bottom action output was not ranked as expected: {action!r}")
+
+    summary = run_explorer_query(frame, "average moisture")
+    if "The average" not in summary or "10.50" not in summary:
+        fails.append(f"average summary output was not deterministic: {summary!r}")
+
+    corr = run_explorer_query(frame, "correlation between Revenue and Moisture_pct")
+    if "r =" not in corr:
+        fails.append(f"correlation output was not generated: {corr!r}")
+
+    try:
+        run_explorer_query(frame, "highest nonsense by region")
+    except ValueError as exc:
+        if "Available columns" not in str(exc):
+            fails.append(f"fuzzy query fallback did not explain missing match: {exc!r}")
+    else:
+        fails.append("ambiguous explorer query did not fail with a helpful message")
     return fails
 
 
@@ -479,6 +558,8 @@ def main():
     elif not near(r["slope"], expected_regression.slope, 1e-10) or not near(r["r"], expected_regression.rvalue, 1e-10):
         fails.append(f"F slope/r {r.get('slope')}/{r.get('r')}")
 
+    fails.extend(explorer_regressions())
+    fails.extend(assumption_and_ingestion_regressions())
     fails.extend(feature_regressions())
     fails.extend(variable_classification_regressions())
     fails.extend(data_health_regressions())
