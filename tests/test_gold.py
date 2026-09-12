@@ -148,6 +148,51 @@ def telegram_regression_failures():
     return failures
 
 
+def variable_classification_regressions():
+    fails = []
+
+    crm_df = pd.DataFrame({
+        "Row ID": list(range(1, 9)),
+        "Customer ID": [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008],
+        "Created Date": [
+            "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05",
+            "2024-01-06", "2024-01-07", "2024-01-08", "2024-01-09",
+        ],
+        "Region": ["North", "North", "South", "South", "East", "East", "West", "West"],
+        "Revenue": [4200.0, 4305.0, 4520.0, 4700.0, 4865.0, 4920.0, 5040.0, 5155.0],
+        "Lead Score": [61, 68, 72, 79, 74, 88, 91, 85],
+    })
+    crm_route = _multivariate_table_route(crm_df)
+    if crm_route is None or crm_route.get("kind") != "multivariate":
+        fails.append(f"CRM route should stay multivariate but returned {crm_route!r}")
+    else:
+        bad_metrics = {"Row ID", "Customer ID", "Created Date"}
+        metric_names = set(crm_route.get("outcomes", []))
+        if bad_metrics & metric_names:
+            fails.append(f"CRM metric selector leaked metadata/date columns: {metric_names}")
+        if "Revenue" not in metric_names or "Lead Score" not in metric_names:
+            fails.append(f"CRM metric selector lost valid metrics: {metric_names}")
+
+    serial_date_df = pd.DataFrame({
+        "Index": list(range(1, 7)),
+        "Group": ["A", "A", "B", "B", "C", "C"],
+        "Date Created": [44001, 44012, 44023, 44034, 44045, 44056],
+        "Dose_mg": [20.2, 21.1, 22.4, 23.5, 24.8, 25.6],
+        "Outcome_Count": [102, 118, 130, 150, 162, 175],
+    })
+    serial_route = _multivariate_table_route(serial_date_df)
+    if serial_route is None or serial_route.get("kind") != "multivariate":
+        fails.append(f"serial-date route should stay multivariate but returned {serial_route!r}")
+    else:
+        metric_names = set(serial_route.get("outcomes", []))
+        if "Date Created" in metric_names:
+            fails.append(f"Excel serial date leaked into metrics: {metric_names}")
+        if "Dose_mg" not in metric_names or "Outcome_Count" not in metric_names:
+            fails.append(f"valid continuous metrics missing from serial-date route: {metric_names}")
+
+    return fails
+
+
 def feature_regressions():
     fails = []
 
@@ -315,6 +360,7 @@ def main():
         fails.append(f"F slope/r {r.get('slope')}/{r.get('r')}")
 
     fails.extend(feature_regressions())
+    fails.extend(variable_classification_regressions())
     fails.extend(chart_regression_failures())
     fails.extend(reporting_regression_failures())
     fails.extend(telegram_regression_failures())

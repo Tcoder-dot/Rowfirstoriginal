@@ -151,21 +151,63 @@ def sanitize_incoming_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None:
 def _numeric_table_columns(frame: pd.DataFrame) -> list[str]:
     numeric: list[str] = []
     for column in frame.columns:
+        if _is_identifier_column(frame, column) or _is_temporal_or_datetime_column(frame, column):
+            continue
         values = pd.to_numeric(frame[column], errors="coerce")
         if values.notna().sum() >= max(1, int(len(frame) * 0.8)):
             numeric.append(column)
     return numeric
 
 
+def _is_strict_row_identifier_series(series: pd.Series) -> bool:
+    non_null = series.dropna()
+    if non_null.empty:
+        return False
+    numeric = pd.to_numeric(non_null, errors="coerce")
+    if numeric.empty or numeric.notna().sum() != len(non_null):
+        return False
+    sequence = numeric.astype(int).tolist() if (numeric % 1 == 0).all() else []
+    if not sequence:
+        return False
+    expected_one_based = list(range(1, len(non_null) + 1))
+    expected_zero_based = list(range(len(non_null)))
+    return sequence == expected_one_based or sequence == expected_zero_based
+
+
+def _is_temporal_or_datetime_column(frame: pd.DataFrame, column: str) -> bool:
+    if column not in frame.columns:
+        return False
+    series = frame[column]
+    if isinstance(series.dtype, pd.DatetimeTZDtype) or pd.api.types.is_datetime64_any_dtype(series):
+        return True
+    name = str(column).lower()
+    if re.search(r"(?i)(date|time|timestamp|created|updated|renewal|activity|period|quarter|year|month)", name):
+        non_null = series.dropna().astype(str)
+        if non_null.empty:
+            return True
+        text_like = non_null.str.contains(r"[-/T Z]|Q[1-4]\s*\d{4}", case=False, regex=True)
+        if text_like.any():
+            return True
+        numeric = pd.to_numeric(series, errors="coerce").dropna()
+        if not numeric.empty and numeric.between(40000, 60000).all() and len(numeric) >= max(1, int(len(series) * 0.8)):
+            return True
+        return True
+    return False
+
+
 def _is_identifier_column(frame: pd.DataFrame, column: str) -> bool:
     if column not in frame.columns:
         return False
     normalized = _table_column_name(column)
-    if re.search(r"(?:^id$|_id$|record|serial|uuid|identifier)", normalized, flags=re.I):
+    if re.fullmatch(r"(?i)(index|id|row_id|_id|uuid|record_id|unnamed|sn|s/n)", normalized):
+        return True
+    if re.search(r"(?i)(?:^|(?:row|record|customer|account|patient|student|subject|user|order|transaction|employee|member|case|lead|invoice|product|client))id$|(?:^|_)index$|(?:^|_)uuid$|(?:^|_)sn$|(?:^|_)unnamed$", normalized):
         return True
     if normalized in _TABLE_ID_NAMES:
         return True
     series = frame[column]
+    if _is_strict_row_identifier_series(series):
+        return True
     if pd.api.types.is_numeric_dtype(series):
         return False
     non_null = series.dropna()
@@ -209,9 +251,10 @@ def _multivariate_table_route(frame: pd.DataFrame | None) -> dict[str, Any] | No
     numeric_columns = [column for column in _numeric_table_columns(frame) if not _is_identifier_column(frame, column)]
     numeric_set = set(numeric_columns)
     identifier_columns = [column for column in frame.columns if _is_identifier_column(frame, column)]
+    temporal_columns = [column for column in frame.columns if _is_temporal_or_datetime_column(frame, column)]
     factor_columns: list[str] = [
         column for column in frame.columns
-        if column not in numeric_set and column not in identifier_columns
+        if column not in numeric_set and column not in identifier_columns and column not in temporal_columns
     ]
     for column in numeric_columns:
         normalized = _table_column_name(column)
@@ -235,12 +278,15 @@ def _multivariate_table_route(frame: pd.DataFrame | None) -> dict[str, Any] | No
 
     outcome_columns = [
         column for column in numeric_columns
-        if column not in factor_columns and not _is_binary_or_flag_numeric(frame[column]) and _is_valid_continuous_outcome(frame[column])
+        if column not in factor_columns
+        and column not in temporal_columns
+        and not _is_binary_or_flag_numeric(frame[column])
+        and _is_valid_continuous_outcome(frame[column])
     ]
     if not outcome_columns:
         outcome_columns = [
             column for column in numeric_columns
-            if column not in factor_columns and not _is_binary_or_flag_numeric(frame[column])
+            if column not in factor_columns and column not in temporal_columns and not _is_binary_or_flag_numeric(frame[column])
         ]
     if factor_columns and outcome_columns:
         return {
