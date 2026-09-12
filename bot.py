@@ -6,10 +6,11 @@ Gemini is used only for table extraction from photo/PDF/DOCX when configured.
 from __future__ import annotations
 
 import ast
-import json
 import csv
+import difflib
 import hashlib
 import io
+import json
 import os
 import re
 import tempfile
@@ -25,6 +26,7 @@ from scipy import stats
 
 from chapter4 import write_docx
 from charts import make_charts
+from document_extractor import build_extraction_preview, extract_document_table, extract_structured_table
 from handle import analyze_ingested, build_breakdown, handle_analyze
 from ingest import ingest_file, ingest_text
 from qa import quality_check
@@ -40,6 +42,7 @@ except ImportError:
 health_app = Flask(__name__)
 user_sessions: dict[int, dict[str, Any]] = {}
 last_engine: dict[int, dict[str, Any]] = {}
+pending_extracted: dict[int, dict[str, Any]] = {}
 _INGESTION_DELIVERY_CACHE: set[tuple[int, int]] = set()
 
 
@@ -324,43 +327,190 @@ def _singleton_groups_for_frame(frame: pd.DataFrame, factor_name: str) -> list[d
     return [{"name": str(name), "n": int(count)} for name, count in counts.items() if count == 1]
 
 
-def _summarize_dataframe(frame: pd.DataFrame) -> str:
+def _canonicalize_text(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"(?i)\b(?:inc|ltd|limited|llc|corp|company|co|sa|s\.a\.|gmbh|plc|pte|pvt)\b$", "", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _detect_currency_pollution(series: pd.Series) -> bool:
+    values = series.dropna().astype(str)
+    if values.empty:
+        return False
+    for value in values.tolist():
+        cleaned = value.strip().lower()
+        if re.search(r"[$€£₦]|(?<![a-z])\d+(?:\.\d+)?[kmb](?![a-z])", cleaned):
+            return True
+    return False
+
+
+def _detect_mixed_date_format(series: pd.Series) -> bool:
+    values = series.dropna().astype(str)
+    if values.empty:
+        return False
+    kinds: set[str] = set()
+    for value in values.tolist():
+        text = value.strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if re.search(r"q[1-4]\s*\d{2,4}", lowered):
+            kinds.add("quarter")
+        elif re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", text) or "t" in lowered and re.search(r"\d{2}:\d{2}", text):
+            kinds.add("iso")
+        elif re.search(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}", text):
+            kinds.add("slash")
+        elif text.isdigit() and 40000 <= int(text) <= 60000:
+            kinds.add("excel_serial")
+    return len(kinds) >= 2
+
+
+def _build_data_health_profile(frame: pd.DataFrame | None) -> dict[str, Any]:
     if frame is None or frame.empty:
-        return "Data summary unavailable."
-    rows, cols = frame.shape
-    missing = int(frame.isna().sum().sum())
-    categorical = []
+        return {
+            "rows": 0,
+            "columns": 0,
+            "cells": 0,
+            "missing_total": 0,
+            "missing_pct": 0.0,
+            "duplicate_rows": 0,
+            "health_score": 100.0,
+            "missing_by_column": [],
+            "constant_columns": [],
+            "currency_columns": [],
+            "date_columns": [],
+            "near_duplicate_columns": [],
+            "findings": [],
+        }
+    rows = int(len(frame))
+    columns = int(len(frame.columns))
+    total_cells = int(frame.size)
+    missing_by_column = []
     for column in frame.columns:
         series = frame[column]
-        if pd.api.types.is_numeric_dtype(series):
-            numeric_value_count = series.notna().sum()
-            if numeric_value_count and series.nunique(dropna=True) <= min(20, max(3, rows)):
-                categorical.append(f"- {column}: {int(series.nunique(dropna=True))} unique levels")
-        else:
-            categorical.append(f"- {column}: {int(series.nunique(dropna=True))} unique levels")
-    numeric_columns = [column for column in frame.columns if pd.api.types.is_numeric_dtype(frame[column])]
-    numeric_summary = ""
-    if numeric_columns:
-        top = numeric_columns[:5]
-        numeric_summary = "\n".join(f"- {column}: numeric column" for column in top)
-        numeric_summary += f"\n- Total numeric columns: {len(numeric_columns)}"
-    singleton_flags = []
+        missing_count = int(series.isna().sum())
+        if missing_count > 0:
+            completeness = 100.0 * (1.0 - (missing_count / max(1, rows)))
+            missing_by_column.append({
+                "column": str(column),
+                "missing": missing_count,
+                "missing_pct": round(100.0 * (missing_count / max(1, rows)), 1),
+                "completeness": round(completeness, 1),
+            })
+    missing_total = int(sum(item["missing"] for item in missing_by_column))
+    missing_pct = 0.0 if total_cells == 0 else 100.0 * (missing_total / total_cells)
+    overall_score = max(0.0, 100.0 - missing_pct)
+    duplicate_rows = int(frame.duplicated().sum())
+    constant_columns = [str(column) for column in frame.columns if frame[column].dropna().nunique(dropna=True) <= 1]
+    currency_columns = []
+    date_columns = []
+    near_duplicate_columns = []
     for column in frame.columns:
-        if frame[column].dropna().nunique() <= 1:
-            singleton_flags.append(f"- {column}: singleton/constant column detected")
-    summary = [
+        series = frame[column]
+        if _detect_currency_pollution(series):
+            currency_columns.append(str(column))
+        if _detect_mixed_date_format(series):
+            date_columns.append(str(column))
+        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+            values = series.dropna().astype(str)
+            if values.empty:
+                continue
+            canonical = [_canonicalize_text(value) for value in values.tolist()]
+            seen: dict[str, list[str]] = {}
+            for value in canonical:
+                if not value:
+                    continue
+                seen.setdefault(value, []).append(value)
+            near_examples: list[str] = []
+            unique_roots = sorted({value for value in canonical if value})
+            for i, left in enumerate(unique_roots):
+                for right in unique_roots[i + 1:]:
+                    if left == right:
+                        continue
+                    ratio = difflib.SequenceMatcher(None, left, right).ratio()
+                    if ratio >= 0.82:
+                        near_examples.extend([left, right])
+                        break
+                if near_examples:
+                    break
+            if near_examples:
+                near_duplicate_columns.append({"column": str(column), "examples": sorted(set(near_examples))[:3]})
+    findings = []
+    if missing_total:
+        findings.append(f"Missing values: {missing_total} cells ({missing_pct:.1f}% of dataset)")
+    if duplicate_rows:
+        findings.append(f"Duplicate rows: {duplicate_rows}")
+    if constant_columns:
+        findings.append(f"Constant columns: {', '.join(constant_columns[:5])}")
+    if date_columns:
+        findings.append(f"Mixed date formats: {', '.join(date_columns[:5])}")
+    if currency_columns:
+        findings.append(f"Currency symbols detected: {', '.join(currency_columns[:5])}")
+    if near_duplicate_columns:
+        examples = "; ".join(f"{item['column']}={', '.join(item['examples'])}" for item in near_duplicate_columns[:2])
+        findings.append(f"Likely duplicate labels: {examples}")
+    if not findings:
+        findings.append("No material hygiene issues detected.")
+    return {
+        "rows": rows,
+        "columns": columns,
+        "cells": total_cells,
+        "missing_total": missing_total,
+        "missing_pct": round(missing_pct, 1),
+        "duplicate_rows": duplicate_rows,
+        "health_score": round(overall_score, 1),
+        "missing_by_column": missing_by_column,
+        "constant_columns": constant_columns,
+        "currency_columns": currency_columns,
+        "date_columns": date_columns,
+        "near_duplicate_columns": near_duplicate_columns,
+        "findings": findings,
+    }
+
+
+def _format_data_health_card(profile: dict[str, Any]) -> str:
+    lines = [
+        "Data Health Card",
         "Data Ingestion Card",
-        f"Shape: {rows} rows x {cols} columns",
+        "",
+        "Shape",
+        f"- {profile.get('rows', 0)} rows x {profile.get('columns', 0)} columns",
+        "",
+        "Dataset Overview",
+        f"- Total Cells: {profile.get('cells', 0)}",
+        f"- Overall Data Health Score: {profile.get('health_score', 100.0):.1f}%",
+        f"- Missing Cells: {profile.get('missing_total', 0)} ({profile.get('missing_pct', 0.0):.1f}%)",
+        f"- Duplicate Rows: {profile.get('duplicate_rows', 0)}",
+        "",
         "Detected Categorical Factors:",
-        *(categorical[:10] or ["- None detected"]),
+        *([f"- {item['column']}: {item['missing']} missing values" for item in profile.get('missing_by_column', [])[:5]] or ["- None detected"]),
+        "",
         "Detected Numeric Metrics:",
-        numeric_summary or "- None detected",
+        *([f"- {item['column']}: completeness {item['completeness']:.1f}%" for item in profile.get('missing_by_column', [])[:5]] or ["- None detected"]),
+        "",
         "Missing Values / Data Health:",
-        f"- Missing cells: {missing} total",
-        "- Zero-singleton confirmation:",
-        *(singleton_flags or ["- No singleton-only columns detected"]),
+        f"- Missing cells: {profile.get('missing_total', 0)} total",
+        f"- Duplicate rows: {profile.get('duplicate_rows', 0)}",
+        "",
+        "Critical Findings",
     ]
-    return "\n".join(summary)
+    findings = profile.get("findings") or ["No material hygiene issues detected."]
+    for item in findings[:8]:
+        lines.append(f"- {item}")
+    lines.extend([
+        "",
+        "Hygiene Actions Taken",
+        "- Clean CSV export sent automatically",
+        "- Styled Excel export sent automatically",
+        "- Step 1 variable selection continues immediately",
+    ])
+    return "\n".join(lines)
+
+
+def _summarize_dataframe(frame: pd.DataFrame) -> str:
+    profile = _build_data_health_profile(frame)
+    return _format_data_health_card(profile)
 
 
 def _safe_python_globals() -> dict[str, Any]:
@@ -559,6 +709,15 @@ def _output_selector_markup() -> Any:
         types.InlineKeyboardButton("📑 Academic Report (.pdf)", callback_data="output:pdf"),
         types.InlineKeyboardButton("📊 Clean Processed Excel (.xlsx) / CSV", callback_data="output:excel"),
         types.InlineKeyboardButton("📦 Full Package (All Formats)", callback_data="output:full"),
+    )
+    return markup
+
+
+def _table_confirmation_markup() -> Any:
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("✅ Looks Accurate — Proceed", callback_data="extract:accept"),
+        types.InlineKeyboardButton("🔄 Re-upload as CSV/Excel", callback_data="extract:retry"),
     )
     return markup
 
@@ -1370,6 +1529,36 @@ def main() -> None:
             return
         _deliver_requested_outputs(bot, call, engine, chat_id, requested)
 
+    @bot.callback_query_handler(func=lambda call: (getattr(call, "data", "") or "").startswith("extract:"))
+    def on_extraction_confirmation(call: Any) -> None:
+        chat_id = call.message.chat.id
+        callback_data = call.data or ""
+        bot.answer_callback_query(call.id)
+        state = pending_extracted.get(chat_id)
+        if not state or state.get("df") is None:
+            bot.reply_to(call.message, "No extracted table is pending confirmation. Please upload or paste a fresh table.")
+            return
+        frame = state["df"].copy()
+        if callback_data == "extract:accept":
+            user_sessions[chat_id] = {"df": frame}
+            pending_extracted.pop(chat_id, None)
+            _send_ingestion_card(bot, call.message, frame, offer_download=True)
+            route = _multivariate_table_route(frame)
+            if route and route.get("kind") == "multivariate":
+                _prompt_multivariate(call.message, route)
+            else:
+                csv_text = frame.to_csv(index=False)
+                engine = _run_analysis(csv_text)
+                if engine.get("ok"):
+                    last_engine[chat_id] = engine
+                _send_analysis(bot, call.message, engine)
+            return
+        if callback_data == "extract:retry":
+            pending_extracted.pop(chat_id, None)
+            bot.reply_to(call.message, "Please re-upload a CSV/Excel file or paste the table directly so I can reprocess it.")
+            return
+        bot.answer_callback_query(call.id, "Unknown extraction decision.", show_alert=True)
+
     def _maybe_route_multivariate(message: Any, raw_text: str) -> bool:
         route = _multivariate_table_route(_read_delimited_frame(raw_text))
         if not route:
@@ -1689,12 +1878,18 @@ def main() -> None:
                         bot.reply_to(message, "Choose your output format:", reply_markup=_output_selector_markup())
                     return
                 if suffix in GEMINI_SUFFIXES:
-                    table = _gemini_extract(path)
-                    pending[message.chat.id] = {
-                        "text": _table_as_csv(table),
-                        "source": suffix,
-                    }
-                    _reply_block(bot, message, _table_preview(table))
+                    frame = extract_structured_table(path)
+                    if frame is None or frame.empty:
+                        table = _gemini_extract(path)
+                        pending[message.chat.id] = {
+                            "text": _table_as_csv(table),
+                            "source": suffix,
+                        }
+                        _reply_block(bot, message, _table_preview(table))
+                        return
+                    pending_extracted[message.chat.id] = {"df": frame}
+                    preview = build_extraction_preview(frame)
+                    bot.reply_to(message, preview, reply_markup=_table_confirmation_markup())
                     return
         except Exception as exc:
             _send_error(bot, message, exc)
@@ -1713,20 +1908,20 @@ def main() -> None:
                 path = Path(tmp) / "photo.jpg"
                 info = bot.get_file(message.photo[-1].file_id)
                 path.write_bytes(bot.download_file(info.file_path))
-                table = _gemini_extract(path)
-                csv_text = _table_as_csv(table)
-                frame = sanitize_incoming_dataframe(_read_delimited_frame(csv_text))
+                frame = extract_structured_table(path)
+                if frame is None or frame.empty:
+                    table = _gemini_extract(path)
+                    csv_text = _table_as_csv(table)
+                    frame = sanitize_incoming_dataframe(_read_delimited_frame(csv_text))
                 if frame is not None:
-                    user_sessions[message.chat.id] = {"df": frame}
-                    _send_ingestion_card(bot, message, frame, offer_download=True)
-                engine = handle_analyze({"text": csv_text})
+                    pending_extracted[message.chat.id] = {"df": frame}
+                    preview = build_extraction_preview(frame)
+                    bot.reply_to(message, preview, reply_markup=_table_confirmation_markup())
+                    return
+                engine = handle_analyze({"text": ""})
                 if engine.get("ok"):
                     last_engine[message.chat.id] = engine
                 _send_analysis(bot, message, engine)
-                if _assumption_failure(engine):
-                    bot.reply_to(message, "Assumptions violated: Proceed with standard test or run non-parametric alternative?", reply_markup=_choice_markup("assumption", ["standard", "nonparametric"]))
-                else:
-                    bot.reply_to(message, "Choose your output format:", reply_markup=_output_selector_markup())
         except Exception as exc:
             _send_error(bot, message, exc, "Could not read the photo")
         finally:

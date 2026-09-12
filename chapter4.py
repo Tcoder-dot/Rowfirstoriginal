@@ -190,11 +190,64 @@ def write_pdf(engine: dict[str, Any], path: str | Path) -> str:
     return str(destination)
 
 
+def _humanize_label(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "Outcome"
+    lowered = text.lower()
+
+    if re.search(r"(?i)\btotal\s+viable\s+count\b.*\b(?:log|ln)\b.*\bcfu\b", lowered):
+        return "Total Viable Count (log CFU/g)"
+    if re.search(r"(?i)\b(?:log|ln)\b.*\bcfu\b", lowered):
+        return "Total Viable Count (log CFU/g)"
+    if re.search(r"(?i)\b(?:revenue|lead\s+score|customer\s+value|net\s+sales|sales|score|count|rate|value)\b", lowered):
+        text = text.replace("_", " ")
+        text = re.sub(r"[-/]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return " ".join(part.capitalize() for part in text.split())
+
+    text = text.replace("_", " ")
+    text = text.replace("-", " ")
+    text = re.sub(r"(?i)\b([A-Za-z])([A-Z])\b", r"\1 \2", text)
+    text = re.sub(r"(?i)\b(?:log|ln|sqrt|pct|percent|count|score|rate|mass|density)\b", lambda m: m.group(0).title(), text)
+    text = re.sub(r"(?i)\bcfu\b", "CFU", text)
+    text = re.sub(r"(?i)\b(g|mg|kg|ml|l|mm|cm|um)\b", lambda m: m.group(1).upper(), text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if re.search(r"(?i)\bCFU\b", text) and "/g" not in text and "g" not in text.lower():
+        text = text.replace("CFU", "CFU/g")
+    words = text.split()
+    title_words: list[str] = []
+    for index, word in enumerate(words):
+        lower = word.lower()
+        if lower in {"and", "or", "of", "for", "the", "a", "an", "on", "in", "to", "vs"}:
+            title_words.append(lower if index == 0 else lower)
+            continue
+        if lower in {"cfu", "log", "ln", "sqrt", "pct", "percent", "id", "n", "sd", "se", "ci", "m", "f", "t"}:
+            title_words.append(lower.upper() if lower in {"cfu", "id", "n", "sd", "se", "ci", "m", "f", "t"} else lower.title())
+            continue
+        if lower in {"g", "mg", "kg", "ml", "l", "mm", "cm", "um"}:
+            title_words.append(lower.upper())
+            continue
+        title_words.append(word.title())
+    title = " ".join(title_words)
+    title = re.sub(r"(?i)\bLog\b", "log", title)
+    title = re.sub(r"(?i)\bCFU/g\b", "CFU/g", title)
+    if re.search(r"(?i)\bCFU/g\b", title) and "(" not in title:
+        title = re.sub(r"\b(log\s+CFU/g)\b", "(log CFU/g)", title)
+    return title.strip() or "Outcome"
+
+
 def _preamble(engine: dict[str, Any], results: list[dict[str, Any]]) -> list[str]:
     lines = []
     topic = engine.get("topic")
     if topic:
         lines.append(f"Topic: {topic}.")
+    for result in results:
+        factor_name = str(result.get("factor") or result.get("groupingVariable") or "Treatment")
+        outcome_name = _humanize_label(_outcome_name(result))
+        factor_label = _humanize_label(factor_name)
+        lines.append(f"A one-way analysis of variance (ANOVA) was conducted to evaluate the effect of {factor_label} on {outcome_name}.")
+        break
     lines.extend([
         f"The analysis used a {_design(results)} design.",
         _sample_description(results),
@@ -234,17 +287,17 @@ def _subject(engine: dict[str, Any], results: list[dict[str, Any]]) -> str:
     names = []
     for result in results:
         if result.get("parameter"):
-            names.append(str(result["parameter"]))
+            names.append(_humanize_label(result["parameter"]))
         elif result.get("test") == "two-way anova":
-            names.append(str(result.get("outcome", "the measured outcome")))
+            names.append(_humanize_label(result.get("outcome", "Outcome")))
         elif result.get("test") == "simple linear regression":
-            names.append(f"{result.get('predictor', 'predictor')} and {result.get('outcome', 'outcome')}")
+            names.append(f"{_humanize_label(result.get('predictor', 'Predictor'))} and {_humanize_label(result.get('outcome', 'Outcome'))}")
         elif result.get("test") in {"pearson", "spearman"}:
-            names.append(f"{result.get('xName', 'X')} and {result.get('yName', 'Y')}")
+            names.append(f"{_humanize_label(result.get('xName', 'X'))} and {_humanize_label(result.get('yName', 'Y'))}")
         elif result.get("test") in {"student-t", "welch-t", "one-way anova"}:
-            names.append("the treatment groups")
+            names.append("treatment groups")
         elif result.get("test") == "paired-t":
-            names.append(f"{result.get('before', {}).get('name', 'before')} and {result.get('after', {}).get('name', 'after')}")
+            names.append(f"{_humanize_label(result.get('before', {}).get('name', 'Before'))} and {_humanize_label(result.get('after', {}).get('name', 'After'))}")
         else:
             names.append("the contingency table")
     return ", ".join(dict.fromkeys(names)) or "the submitted data"
@@ -398,7 +451,7 @@ def _group_row(group: dict[str, Any]) -> tuple[str, str, str, str, str]:
 def _inferential_rows(results: list[dict[str, Any]]) -> list[tuple[str, str, str, str, str, str]]:
     rows = []
     for result in results:
-        name = _outcome_name(result)
+        name = _humanize_label(_outcome_name(result))
         test = result.get("test")
         if test in {"student-t", "welch-t", "paired-t"}:
             rows.append((
@@ -520,7 +573,7 @@ def _discussion(engine: dict[str, Any]) -> list[str]:
 
 
 def _interpretation_clause(result: dict[str, Any]) -> str:
-    label = _outcome_name(result)
+    label = _humanize_label(_outcome_name(result))
     test = result.get("test")
     if test in {"student-t", "welch-t"}:
         groups = [result["group1"], result["group2"]]
@@ -863,16 +916,16 @@ def _group_direction(result: dict[str, Any]) -> tuple[str, str, str] | None:
 
 
 def _synthesis_fragment(result: dict[str, Any]) -> str:
-    label = _outcome_name(result)
+    label = _humanize_label(_outcome_name(result))
     test = result.get("test")
     if test == "two-way anova":
         effects = ", ".join(str(effect["effect"]) for effect in result.get("effects", []))
         return f"{label} effects across {effects or 'the tested factors'}"
     if test == "simple linear regression":
-        return f"{label} rose with {result['predictor']}" if result["slope"] >= 0 else f"{label} fell as {result['predictor']} rose"
+        return f"{label} rose with {_humanize_label(result.get('predictor', 'Predictor'))}" if result["slope"] >= 0 else f"{label} fell as {_humanize_label(result.get('predictor', 'Predictor'))} rose"
     if test in {"pearson", "spearman"}:
         return f"{label} moved with its paired column" if result["r"] >= 0 else f"{label} moved against its paired column"
-    return f"{label} changed across the submitted data"
+    return f"{label} changed across the observed data"
 
 
 def _join_items(items: list[str]) -> str:
@@ -884,13 +937,14 @@ def _join_items(items: list[str]) -> str:
 
 
 def _outcome_name(result: dict[str, Any]) -> str:
-    if result.get("parameter") or result.get("outcome") or result.get("outcomeName"):
-        return str(result.get("parameter") or result.get("outcome") or result.get("outcomeName"))
+    direct = result.get("parameter") or result.get("outcome") or result.get("outcomeName")
+    if direct:
+        return str(direct)
     if result.get("test") == "paired-t":
         return f"{result.get('before', {}).get('name', 'before')} vs {result.get('after', {}).get('name', 'after')}"
     if result.get("test") in {"fisher-exact", "chi-square"}:
         return "count categories"
-    return "Measured outcome"
+    return "measured outcome"
 
 
 def _decision(significant: bool) -> str:

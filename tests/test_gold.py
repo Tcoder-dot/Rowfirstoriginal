@@ -20,9 +20,13 @@ from bot import (
     _summarize_dataframe,
     _singleton_groups_for_frame,
 )
+from PIL import Image
+from docx import Document
+
 from chapter4 import write_docx, to_markdown
 from charts import make_charts
 from handle import handle_analyze
+from document_extractor import extract_document_table, sanitize_extracted_table
 
 
 def near(a, b, tol=0.02):
@@ -193,6 +197,85 @@ def variable_classification_regressions():
     return fails
 
 
+def data_health_regressions():
+    fails = []
+
+    messy = pd.DataFrame({
+        "Row ID": [1, 2, 3, 4, 5, 6],
+        "Customer": ["Acme Inc", "Acme Inc", "Beta Ltd", "Beta Ltd", "Gamma", "Gamma"],
+        "Region": ["North", "North", "South", "South", "East", ""],
+        "Revenue": ["$1200", "$1,250", "£900", "£950", "N/A", "1100"],
+        "Created On": ["2024-01-02", "01/03/2024", "2024-Q1", "2024-01-05", "44050", "2024-01-07"],
+        "Units Sold": [10, 12, None, 15, 20, 21],
+        "Order ID": [101, 101, 203, 204, 205, 206],
+    })
+    messy = messy.drop_duplicates(subset=["Order ID"], keep="first")
+    summary = _summarize_dataframe(messy)
+    if "Data Health Card" not in summary:
+        fails.append("health card heading missing")
+    if "Missing Cells" not in summary or "Duplicate Rows" not in summary:
+        fails.append("health card missing key metrics")
+    if "Currency symbols detected" not in summary or "Mixed date formats" not in summary:
+        fails.append("health card failed to flag formatting anomalies")
+
+    route = _multivariate_table_route(messy)
+    if route is None or route.get("kind") != "multivariate":
+        fails.append(f"messy dataset should remain multivariate but got {route!r}")
+    else:
+        leaked = {"Row ID", "Order ID", "Created On"}
+        if leaked & set(route.get("outcomes", [])):
+            fails.append(f"metadata/date columns leaked into outcome selection: {route.get('outcomes')}")
+
+    return fails
+
+
+def document_narrative_regressions():
+    fails = []
+    engine = {
+        "ok": True,
+        "topic": "Microbial viability screening",
+        "ingested": {"format": "labelled", "groups": [
+            {"name": "Control", "values": [7.1, 7.4, 7.5, 7.2, 7.3]},
+            {"name": "Treatment_A", "values": [8.8, 9.1, 9.3, 9.2, 8.9]},
+            {"name": "Treatment_B", "values": [10.2, 10.5, 10.6, 10.3, 10.4]},
+        ]},
+        "results": [{
+            "test": "one-way anova",
+            "parameter": "total_viable_count_log_cfu",
+            "groups": [
+                {"name": "Control", "n": 5, "mean": 7.3, "sd": 0.17},
+                {"name": "Treatment_A", "n": 5, "mean": 9.06, "sd": 0.19},
+                {"name": "Treatment_B", "n": 5, "mean": 10.4, "sd": 0.15},
+            ],
+            "dfb": 2,
+            "dfw": 12,
+            "F": 145.2,
+            "p": 0.0001,
+            "isSignificant": True,
+            "effectSize": {"etaSquared": 0.96, "omegaSquared": 0.94},
+            "postHoc": {"comparisons": [
+                {"group1": "Control", "group2": "Treatment_A", "pAdjusted": 0.002, "reject": True},
+                {"group1": "Control", "group2": "Treatment_B", "pAdjusted": 0.0001, "reject": True},
+            ]},
+        }],
+    }
+    markdown = to_markdown(engine)
+    if "the submitted outcome" in markdown.lower() or "the variable" in markdown.lower() or "test metric" in markdown.lower():
+        fails.append("dynamic narrative still contains fallback placeholder wording")
+    if "Total Viable Count (log CFU/g)" not in markdown:
+        fails.append("human-readable outcome label was not injected into the narrative")
+    with tempfile.TemporaryDirectory(prefix="rowfirst-docx-narrative-") as output_dir:
+        output_path = Path(output_dir) / "Rowfirst_Chapter4.docx"
+        write_docx(engine, output_path)
+        with zipfile.ZipFile(output_path) as archive:
+            xml = archive.read("word/document.xml").decode("utf-8", errors="ignore").lower()
+            if "the submitted outcome" in xml or "the variable" in xml or "test metric" in xml:
+                fails.append("DOCX output still contains generic placeholder text")
+            if "total viable count" not in xml and "total viable count (log cfu/g)" not in xml:
+                fails.append("DOCX narrative did not include the cleaned variable label")
+    return fails
+
+
 def feature_regressions():
     fails = []
 
@@ -279,6 +362,43 @@ df = pd.DataFrame({
     return fails
 
 
+def extraction_regressions():
+    fails = []
+    with tempfile.TemporaryDirectory(prefix="rowfirst-doc-extract-") as output_dir:
+        path = Path(output_dir) / "sample_table.docx"
+        document = Document()
+        table = document.add_table(rows=3, cols=3)
+        table.cell(0, 0).text = "Treatment"
+        table.cell(0, 1).text = "Dose\nmg"
+        table.cell(0, 2).text = "Result"
+        table.cell(1, 0).text = "A"
+        table.cell(1, 1).text = " 20 \n mg "
+        table.cell(1, 2).text = " 10.5 "
+        table.cell(2, 0).text = "B"
+        table.cell(2, 1).text = "30\nmg"
+        table.cell(2, 2).text = "12.4"
+        document.save(path)
+
+        extracted = extract_document_table(path)
+        if extracted is None or extracted.empty:
+            fails.append("docx extraction did not create a dataframe")
+        else:
+            if list(extracted.columns) != ["Treatment", "Dose mg", "Result"]:
+                fails.append(f"docx columns were not normalized correctly: {list(extracted.columns)}")
+            if extracted.iloc[0].tolist()[:2] != ["A", "20 mg"]:
+                fails.append(f"docx cell sanitation was not normalized: {extracted.iloc[0].tolist()}")
+
+        sanitised = sanitize_extracted_table({"headers": ["Dose", "Result"], "rows": [[" 1,0 ", "O.8"], ["1l", "1.0"]]})
+        if sanitised is None or sanitised["rows"][0][0] != "1.0":
+            fails.append("sanitizer did not clean OCR artifacts and numeric noise")
+
+        blank_image = Path(output_dir) / "blank_image.png"
+        Image.new("RGB", (200, 200), "white").save(blank_image)
+        if extract_document_table(blank_image) is not None:
+            fails.append("blank image should be rejected as malformed extraction input")
+    return fails
+
+
 def main():
     fails = []
 
@@ -361,6 +481,7 @@ def main():
 
     fails.extend(feature_regressions())
     fails.extend(variable_classification_regressions())
+    fails.extend(data_health_regressions())
     fails.extend(chart_regression_failures())
     fails.extend(reporting_regression_failures())
     fails.extend(telegram_regression_failures())
