@@ -962,12 +962,17 @@ def _fmt_sum(value: Any) -> str:
 
 
 def _fmt_p(value: Any) -> str:
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if re.match(r"^p\s*[=<>]", cleaned, flags=re.I):
+            return re.sub(r"^p\s*[=<>]\s*", "", cleaned, flags=re.I)
+        return cleaned
     if not isinstance(value, (int, float)):
         return "not reported"
     number = float(value)
     if number < 0.001:
-        return "p < .001"
-    return f"p = {number:.4f}" if number < 1.0 else f"p = {number:.3f}"
+        return "< .001"
+    return f"{number:.4f}" if number < 1.0 else f"{number:.3f}"
 
 
 def _df(value: Any) -> str:

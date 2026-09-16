@@ -158,7 +158,16 @@ def _tukey_post_hoc(groups: list[dict], arrs: list[np.ndarray]) -> dict[str, Any
 
 def one_way_anova(groups: list[dict], outcome: str | None = None) -> dict[str, Any]:
     arrs = [np.asarray(g["values"], dtype=float) for g in groups]
+    pooled_within_variance = sum(float(np.sum((values - np.mean(values)) ** 2)) for values in arrs)
+    if pooled_within_variance == 0:
+        raise ValueError(
+            "F-test undefined: identical replicate measurements detected with zero within-group variance"
+        )
     res = stats.f_oneway(*arrs)
+    if np.isinf(res.statistic) or np.isnan(res.statistic):
+        raise ValueError(
+            "F-test undefined: identical replicate measurements detected with zero within-group variance"
+        )
     k = len(groups)
     n = sum(len(a) for a in arrs)
     result = {

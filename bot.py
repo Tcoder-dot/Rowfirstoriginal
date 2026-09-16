@@ -65,7 +65,17 @@ def _run_health_server() -> None:
     health_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 
-_GLOBAL_RESET_RE = re.compile(r"(?i)^(cancel|stop|abort|clear|start\s*over|reset|exit|quit|nevermind|back)$")
+_GLOBAL_RESET_RE = re.compile(
+    r"(?i)^(?:cancel|stop|abort|clear|reset|exit|quit|back|never\s*mind|start\s*over)$"
+)
+_GLOBAL_RESET_INTENT_RE = re.compile(
+    r"(?ix)"
+    r"(?:\b(?:cancel|stop|abort|reset|quit|exit)\b|"
+    r"\b(?:never\s*mind|start\s*over|forget\s*(?:it|this|that))\b|"
+    r"\b(?:change|changed)\s+my\s+mind\b|"
+    r"\b(?:do\s+not|don't|dont)\s+(?:continue|proceed|do\s+that)\b)"
+)
+_RESET_CALLBACK_DATA = "choice;calcel session"
 
 
 _TABLE_FACTOR_NAMES = {
@@ -160,12 +170,12 @@ def classify_columns(frame: pd.DataFrame | None) -> dict[str, list[str]]:
                 categorical_factors.append(str(column))
             continue
 
+        if pd.api.types.is_float_dtype(series) or valid_numbers.apply(lambda x: not float(x).is_integer()).any():
+            numeric_metrics.append(str(column))
+            continue
         if valid_numbers.size < max(2, int(len(frame) * 0.8)):
             continue
         if _is_binary_or_flag_numeric(series):
-            continue
-        if pd.api.types.is_float_dtype(series) or valid_numbers.apply(lambda x: not float(x).is_integer()).any():
-            numeric_metrics.append(str(column))
             continue
         if valid_numbers.nunique(dropna=True) <= 5:
             categorical_factors.append(str(column))
@@ -188,13 +198,14 @@ def classify_columns(frame: pd.DataFrame | None) -> dict[str, list[str]]:
                 categorical_factors.append(name)
             continue
 
+        if pd.api.types.is_float_dtype(series) or valid_numbers.apply(lambda x: not float(x).is_integer()).any():
+            numeric_metrics.append(name)
+            continue
         if valid_numbers.size < max(2, int(len(frame) * 0.8)):
             continue
         if _is_binary_or_flag_numeric(series):
             continue
-        if pd.api.types.is_float_dtype(series) or valid_numbers.apply(lambda x: not float(x).is_integer()).any():
-            numeric_metrics.append(name)
-        elif valid_numbers.nunique(dropna=True) <= 5:
+        if valid_numbers.nunique(dropna=True) <= 5:
             categorical_factors.append(name)
         else:
             numeric_metrics.append(name)
@@ -877,11 +888,27 @@ def _remember_active_dataset(chat_id: int, frame: pd.DataFrame | None, *, state:
     user_sessions[chat_id] = session
 
 
-def _handle_global_reset(bot: Any, message: Any) -> bool:
+def _is_global_reset_request(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip())
+    return bool(_GLOBAL_RESET_RE.fullmatch(normalized) or _GLOBAL_RESET_INTENT_RE.search(normalized))
+
+
+def _handle_global_reset(
+    bot: Any,
+    message: Any,
+    *,
+    pending: dict[int, dict[str, str]] | None = None,
+    pending_multivariate: dict[int, dict[str, Any]] | None = None,
+    text_buffers: dict[int, dict[str, Any]] | None = None,
+) -> bool:
     chat_id = int(getattr(message, "chat", None).id)
-    pending_multivariate.pop(chat_id, None)
+    if pending is not None:
+        pending.pop(chat_id, None)
+    if pending_multivariate is not None:
+        pending_multivariate.pop(chat_id, None)
     pending_extracted.pop(chat_id, None)
-    last_engine.pop(chat_id, None)
+    if text_buffers is not None:
+        text_buffers.pop(chat_id, None)
     user_sessions[chat_id] = {"state": "IDLE"}
     try:
         bot.edit_message_reply_markup(chat_id=chat_id, message_id=message.message_id, reply_markup=None)
@@ -946,6 +973,11 @@ def _mark_message_processed(chat_id: int, message_id: int | None) -> bool:
 def _explore_dataset_markup() -> Any:
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton("🔍 Explore Dataset Insights", callback_data="explore:dataset"))
+    return _add_reset_button(markup)
+
+
+def _add_reset_button(markup: Any) -> Any:
+    markup.add(types.InlineKeyboardButton("🧹 Clear & Start Over", callback_data=_RESET_CALLBACK_DATA))
     return markup
 
 
@@ -960,7 +992,7 @@ def _explorer_mode_markup() -> Any:
         types.InlineKeyboardButton("❓ Ask a Question", callback_data="explore:question"),
         types.InlineKeyboardButton("🔙 Back to Analysis", callback_data="explore:back"),
     )
-    return markup
+    return _add_reset_button(markup)
 
 
 def _explorer_back_markup() -> Any:
@@ -968,7 +1000,7 @@ def _explorer_back_markup() -> Any:
         return None
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton("🔙 Back to Analysis", callback_data="explore:back"))
-    return markup
+    return _add_reset_button(markup)
 
 
 def _send_ingestion_card(bot: Any, message: Any, frame: pd.DataFrame, *, offer_download: bool = True) -> None:
@@ -1044,7 +1076,7 @@ def _manual_mapping_markup(frame: pd.DataFrame | None) -> Any:
         types.InlineKeyboardButton("Select Factor (Independent)", callback_data="manualmap:factor"),
         types.InlineKeyboardButton("Select Metric (Dependent)", callback_data="manualmap:metric"),
     )
-    return markup
+    return _add_reset_button(markup)
 
 
 def _deliver_requested_outputs(bot: Any, call: Any, engine: dict[str, Any], chat_id: int, requested: str) -> None:
@@ -1301,11 +1333,13 @@ def _gemini_extract(path: Path) -> dict[str, Any]:
         ".webp": "image/webp",
     }.get(path.suffix.lower(), "application/octet-stream")
     prompt = (
-        "You are an OCR + table-extraction assistant. "
-        "Read the supplied image or document and recover the tabular data as clean CSV or JSON. "
-        "Preserve headers and values exactly, but remove OCR noise and formatting artifacts. "
-        "Return only a machine-readable CSV table or a JSON object shaped like {'headers':[...], 'rows':[[...], ...]}. "
-        "Do not add comments, explanations, or calculations. If no table is present, return 'NO_TABLE'."
+        "You are Rowfirst's OCR ingestion component. Read the supplied image or document and "
+        "recover only the tabular data. Return exactly one JSON object with this shape: "
+        '{"headers":["column"],"rows":[["value"]]}. '
+        "Preserve headers, signs, decimal points, missing cells, and values exactly as observed. "
+        "You may correct obvious OCR character noise, but do not infer missing values, reorder rows, "
+        "summarize, calculate, classify, or interpret anything. Use an empty string for an unreadable "
+        "cell. If no table is present, return {\"headers\":[],\"rows\":[]}."
     )
     last_error: Exception | None = None
     for model_name in dict.fromkeys(model for model in DEFAULT_GEMINI_MODELS if model):
@@ -1314,10 +1348,17 @@ def _gemini_extract(path: Path) -> dict[str, Any]:
 
             genai.configure(api_key=key)
             model = genai.GenerativeModel(model_name)
-            response = model.generate_content([
-                prompt,
-                {"mime_type": mime, "data": path.read_bytes()},
-            ])
+            contents = [prompt, {"mime_type": mime, "data": path.read_bytes()}]
+            try:
+                response = model.generate_content(
+                    contents,
+                    generation_config={
+                        "response_mime_type": "application/json",
+                        "temperature": 0,
+                    },
+                )
+            except TypeError:
+                response = model.generate_content(contents)
             raw = (getattr(response, "text", "") or "").strip()
             payload = _csv_text_to_table(raw)
             if payload is None:
@@ -1335,6 +1376,83 @@ def _gemini_extract(path: Path) -> dict[str, Any]:
     if isinstance(last_error, Exception) and type(last_error).__name__ == "NotFound":
         raise GeminiExtractionError(GEMINI_UNAVAILABLE) from last_error
     raise GeminiExtractionError(GEMINI_FAILED)
+
+
+def _gemini_response_text(response: Any) -> str:
+    text = getattr(response, "text", "") or ""
+    if text:
+        return str(text).strip()
+    for candidate in getattr(response, "candidates", []) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", []) or []:
+            part_text = getattr(part, "text", "") or ""
+            if part_text:
+                return str(part_text).strip()
+    return ""
+
+
+def _read_only_explanation_request(text: str) -> bool:
+    normalized = str(text or "").strip()
+    if not normalized or not re.search(
+        r"(?i)\b(?:why|what does|what do|explain|interpret|meaning|summarize|summary|describe|assumption|significant)\b|\?",
+        normalized,
+    ):
+        return False
+    if re.search(r"(?i)\bwhat does\b.*\bmean\b", normalized):
+        return True
+    return not re.search(
+        r"(?i)\b(?:compare|regression|correlation|anova|t[- ]?test|mann|kruskal|calculate|average|mean|median|highest|lowest|top|predict|run|perform|test)\b",
+        normalized,
+    )
+
+
+def _gemini_read_only_explanation(chat_id: int, question: str) -> str | None:
+    key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        return None
+    session = user_sessions.get(chat_id, {})
+    frame = session.get("df") if isinstance(session, dict) else None
+    engine = last_engine.get(chat_id)
+    if not isinstance(frame, pd.DataFrame) and not isinstance(engine, dict):
+        return None
+    context: dict[str, Any] = {"question": str(question).strip()}
+    if isinstance(frame, pd.DataFrame):
+        context["dataset"] = {
+            "rows": int(frame.shape[0]),
+            "columns": [str(column) for column in frame.columns],
+            "dtypes": {str(column): str(dtype) for column, dtype in frame.dtypes.items()},
+            "missing_values": {str(column): int(value) for column, value in frame.isna().sum().items()},
+            "sample": frame.head(5).fillna("").astype(str).to_dict(orient="records"),
+        }
+    if isinstance(engine, dict):
+        context["engine_results"] = engine
+    context_text = json.dumps(context, default=str, ensure_ascii=True)[:18000]
+    prompt = (
+        "You are Rowfirst's read-only conversational spokesperson. Answer the user's question using "
+        "only the supplied dataset metadata, sample, and verified engine results. Explain existing "
+        "results in plain language, including reported assumptions or significance when present. "
+        "Never calculate, estimate, transform, or invent statistics; never propose a new test; never "
+        "edit the dataset or engine state. If the supplied context does not answer the question, say "
+        "that clearly and ask the user to request a supported analysis. Return concise plain text.\n\n"
+        f"Context JSON:\n{context_text}"
+    )
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=key)
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        try:
+            response = model.generate_content(
+                prompt,
+                generation_config={"temperature": 0.2, "max_output_tokens": 500},
+            )
+        except TypeError:
+            response = model.generate_content(prompt)
+        answer = _gemini_response_text(response)
+        return answer[:4000] if answer else None
+    except Exception as exc:
+        print(f"Gemini explanation failed: {type(exc).__name__}", flush=True)
+        return None
 
 
 def _table_as_csv(table: dict[str, Any]) -> str:
@@ -1638,6 +1756,16 @@ def main() -> None:
         except Exception as exc:
             _send_error(bot, message, exc, "Could not send the welcome message")
 
+    @bot.message_handler(commands=["cancel"])
+    def cancel(message: Any) -> None:
+        _handle_global_reset(
+            bot,
+            message,
+            pending=pending,
+            pending_multivariate=pending_multivariate,
+            text_buffers=text_buffers,
+        )
+
     def _session_actions_markup() -> Any:
         markup = types.InlineKeyboardMarkup(row_width=1)
         markup.add(
@@ -1711,7 +1839,7 @@ def main() -> None:
         ])
         if include_metadata_toggle:
             markup.add(types.InlineKeyboardButton("+ Show Excluded / Metadata Columns", callback_data="meta:toggle"))
-        return markup
+        return _add_reset_button(markup)
 
     def _metadata_choice_markup(frame: pd.DataFrame, prefix: str, *, include_excluded: bool = False) -> Any:
         options = [column for column in frame.columns if _is_identifier_column(frame, column) or _is_temporal_or_datetime_column(frame, column)]
@@ -1765,6 +1893,19 @@ def main() -> None:
             bot.reply_to(call.message, "Session cleared. Ready for your next dataset!")
             return
         bot.answer_callback_query(call.id, "Invalid session action.", show_alert=True)
+
+    @bot.callback_query_handler(
+        func=lambda call: (getattr(call, "data", "") or "") == _RESET_CALLBACK_DATA
+    )
+    def on_cancel_session(call: Any) -> None:
+        bot.answer_callback_query(call.id)
+        _handle_global_reset(
+            bot,
+            call.message,
+            pending=pending,
+            pending_multivariate=pending_multivariate,
+            text_buffers=text_buffers,
+        )
 
     @bot.callback_query_handler(func=lambda call: (getattr(call, "data", "") or "").startswith("singleton:"))
     def on_singleton_triage(call: Any) -> None:
@@ -2195,8 +2336,14 @@ def main() -> None:
     def on_text(message: Any) -> None:
         try:
             text = message.text or ""
-            if _GLOBAL_RESET_RE.match(text.strip()):
-                _handle_global_reset(bot, message)
+            if _is_global_reset_request(text):
+                _handle_global_reset(
+                    bot,
+                    message,
+                    pending=pending,
+                    pending_multivariate=pending_multivariate,
+                    text_buffers=text_buffers,
+                )
                 return
             if text.strip().startswith("/"):
                 return
@@ -2211,6 +2358,11 @@ def main() -> None:
                 return
             session = user_sessions.get(message.chat.id, {})
             if isinstance(session, dict) and session.get("df") is not None and not session.get("ingesting_locked"):
+                if _read_only_explanation_request(text):
+                    explanation = _gemini_read_only_explanation(message.chat.id, text)
+                    if explanation:
+                        bot.reply_to(message, explanation)
+                        return
                 if session.get("explore_prompt") or session.get("state") == "EXPLORER_MODE":
                     frame = session["df"]
                     try:

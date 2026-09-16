@@ -54,11 +54,11 @@ def _resolve_ambiguous(frame: pd.DataFrame, raw_label: str | Any, field_name: st
 
 
 def _infer_numeric_metric(frame: pd.DataFrame) -> str | None:
-    for column in frame.columns:
-        if pd.api.types.is_numeric_dtype(frame[column]):
-            series = pd.to_numeric(frame[column], errors="coerce").dropna()
-            if len(series) >= max(2, int(len(frame) * 0.8)) and series.nunique() > 1:
-                return str(column)
+    numeric_columns = frame.select_dtypes(include=["number"]).columns
+    for column in numeric_columns:
+        series = pd.to_numeric(frame[column], errors="coerce").dropna()
+        if len(series) >= max(2, int(len(frame) * 0.8)):
+            return str(column)
     return None
 
 
