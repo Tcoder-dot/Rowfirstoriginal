@@ -17,6 +17,7 @@ from bot import (
     _detect_singleton_factor,
     _multivariate_table_route,
     _send_analysis,
+    _analyze_ingested_safely,
     _python_script_to_dataframe,
     _summarize_dataframe,
     _singleton_groups_for_frame,
@@ -153,6 +154,42 @@ def telegram_regression_failures():
             failures.append("YES Results Document prompt was not sent")
         if len(bot.photos) != 1 or not bot.photos[0][1]:
             failures.append("chart PNG was not delivered as a Telegram photo")
+    return failures
+
+
+def zero_variance_callback_regressions():
+    """Protect callback analysis from silent failures on identical replicates."""
+    ingested = {
+        "format": "labelled",
+        "groups": [
+            {"name": "A", "values": [10.0, 10.0, 10.0]},
+            {"name": "B", "values": [12.0, 12.0, 12.0]},
+        ],
+    }
+    engine = _analyze_ingested_safely(ingested, outcome_name="Result")
+    failures = []
+    if engine.get("ok"):
+        failures.append("zero-variance analysis unexpectedly returned a result")
+    if "zero within-group variance" not in engine.get("error", ""):
+        failures.append(f"zero-variance error was not preserved: {engine!r}")
+
+    class FakeChat:
+        id = 42
+
+    class FakeMessage:
+        chat = FakeChat()
+
+    class FakeBot:
+        def __init__(self):
+            self.replies = []
+
+        def reply_to(self, message, text):
+            self.replies.append(text)
+
+    bot = FakeBot()
+    _send_analysis(bot, FakeMessage(), engine, ask_for_document=False)
+    if not bot.replies or "zero within-group variance" not in bot.replies[0]:
+        failures.append(f"zero-variance callback did not send an error: {bot.replies!r}")
     return failures
 
 
@@ -591,6 +628,7 @@ def main():
     fails.extend(chart_regression_failures())
     fails.extend(reporting_regression_failures())
     fails.extend(telegram_regression_failures())
+    fails.extend(zero_variance_callback_regressions())
     fails.extend(telegram_token_startup_failures())
 
     if fails:

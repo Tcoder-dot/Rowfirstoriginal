@@ -517,6 +517,23 @@ def _group_size_error(ingested: dict[str, Any]) -> str | None:
     return None
 
 
+def _zero_variance_error(ingested: dict[str, Any]) -> str | None:
+    groups = list(ingested.get("groups") or [])
+    for outcome in ingested.get("outcomes") or []:
+        groups.extend(outcome.get("groups") or [])
+    if len(groups) < 2:
+        return None
+    arrays = [np.asarray(group.get("values", []), dtype=float) for group in groups]
+    if all(
+        len(values) > 1
+        and np.isfinite(values).all()
+        and np.all(values == values[0])
+        for values in arrays
+    ):
+        return "F-test undefined: identical replicate measurements detected with zero within-group variance"
+    return None
+
+
 def _singleton_groups_for_frame(frame: pd.DataFrame, factor_name: str) -> list[dict[str, Any]]:
     if frame.empty or factor_name not in frame.columns:
         return []
@@ -786,7 +803,13 @@ def _analyze_ingested_safely(ingested: dict[str, Any], outcome_name: str | None 
     guard_error = _group_size_error(ingested)
     if guard_error:
         return {"ok": False, "error": guard_error}
-    return analyze_ingested(ingested, outcome_name=outcome_name)
+    variance_error = _zero_variance_error(ingested)
+    if variance_error:
+        return {"ok": False, "error": variance_error}
+    try:
+        return analyze_ingested(ingested, outcome_name=outcome_name)
+    except (ValueError, TypeError, FloatingPointError) as exc:
+        return {"ok": False, "error": str(exc) or exc.__class__.__name__}
 
 
 def _rebuild_ingested_from_frame(frame: pd.DataFrame, factor: str, outcome: str) -> dict[str, Any]:
