@@ -2611,30 +2611,41 @@ def main() -> None:
             return
         if not _begin_ingestion(message.chat.id):
             return
-        try:
-            bot.reply_to(message, "Got it, reading your file…")
-            with tempfile.TemporaryDirectory(prefix="rowfirst-photo-") as tmp:
-                path = Path(tmp) / "photo.jpg"
-                info = bot.get_file(message.photo[-1].file_id)
-                path.write_bytes(bot.download_file(info.file_path))
-                frame = extract_structured_table(path)
-                if frame is None or frame.empty:
-                    table = _gemini_extract(path)
-                    csv_text = _table_as_csv(table)
-                    frame = sanitize_incoming_dataframe(_read_delimited_frame(csv_text))
-                if frame is not None:
-                    pending_extracted[message.chat.id] = {"df": frame}
-                    preview = build_extraction_preview(frame)
-                    bot.reply_to(message, preview, reply_markup=_table_confirmation_markup())
-                    return
-                engine = handle_analyze({"text": ""})
-                if engine.get("ok"):
-                    last_engine[message.chat.id] = engine
-                _send_analysis(bot, message, engine)
-        except Exception as exc:
-            _send_error(bot, message, exc, "Could not read the photo")
-        finally:
-            _finish_ingestion(message.chat.id)
+        bot.reply_to(message, "🖼️ Waking up Gemini... Analyzing your image, please wait.")
+
+        def process_photo() -> None:
+            try:
+                with tempfile.TemporaryDirectory(prefix="rowfirst-photo-") as tmp:
+                    path = Path(tmp) / "photo.jpg"
+                    info = bot.get_file(message.photo[-1].file_id)
+                    path.write_bytes(bot.download_file(info.file_path))
+                    frame = extract_structured_table(path)
+                    if frame is None or frame.empty:
+                        table = _gemini_extract(path)
+                        csv_text = _table_as_csv(table)
+                        frame = sanitize_incoming_dataframe(_read_delimited_frame(csv_text))
+                    if frame is not None:
+                        pending_extracted[message.chat.id] = {"df": frame}
+                        preview = build_extraction_preview(frame)
+                        bot.reply_to(message, preview, reply_markup=_table_confirmation_markup())
+                        return
+                    engine = handle_analyze({"text": ""})
+                    if engine.get("ok"):
+                        last_engine[message.chat.id] = engine
+                    _send_analysis(bot, message, engine)
+            except Exception:
+                bot.reply_to(
+                    message,
+                    "⚠️ Gemini failed to process the image. Please try uploading again or use a CSV.",
+                )
+            finally:
+                _finish_ingestion(message.chat.id)
+
+        threading.Thread(
+            target=process_photo,
+            name="rowfirst-gemini-photo",
+            daemon=True,
+        ).start()
 
     threading.Thread(
         target=_run_health_server,

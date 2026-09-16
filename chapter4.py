@@ -1,6 +1,7 @@
 """Results Document reports built only from the last verified engine JSON."""
 from __future__ import annotations
 
+import math
 from pathlib import Path
 import re
 from typing import Any
@@ -508,13 +509,13 @@ def _working_notes(result: dict[str, Any]) -> list[str]:
         group_text = "; ".join(f"{g['name']}: n={g['n']}, mean={g['mean']:.3f}, SD={g['sd']:.3f}" for g in result.get("groups", []))
         notes = [
             f"Formula: one-way ANOVA; {group_text}.",
-            f"F={result['F']:.12g}, df={result['dfb']}, {result['dfw']}, exact p={_fmt_p(result['p'])}.",
+            f"F={result['F']:.3f}, df={result['dfb']}, {result['dfw']}, exact p={_fmt_p(result['p'])}.",
         ]
         effect_size = result.get("effectSize", {})
         if effect_size:
             notes.append(
-                f"Effect size: eta-squared={effect_size.get('etaSquared', 0.0):.12g}, "
-                f"omega-squared={effect_size.get('omegaSquared', 0.0):.12g}."
+                f"Effect size: eta-squared={effect_size.get('etaSquared', 0.0):.3f}, "
+                f"omega-squared={effect_size.get('omegaSquared', 0.0):.3f}."
             )
         assumptions = result.get("assumptions", {})
         shapiro = "; ".join(
@@ -526,8 +527,14 @@ def _working_notes(result: dict[str, Any]) -> list[str]:
             notes.append(f"Shapiro-Wilk normality checks: {shapiro}.")
         levene = assumptions.get("levene", {})
         if levene.get("p") is not None:
+            levene_w = levene.get("W")
+            levene_w_text = (
+                f"{levene_w:.3f}"
+                if isinstance(levene_w, (int, float)) and not math.isnan(float(levene_w))
+                else "not reported"
+            )
             notes.append(
-                f"Levene variance homogeneity check: W={levene['W']:.12g}, "
+                f"Levene variance homogeneity check: W={levene_w_text}, "
                 f"p={_fmt_p(levene['p'])}."
             )
         post_hoc = result.get("postHoc")
@@ -989,7 +996,11 @@ def _markdown_table(headers: list[str], rows: list[tuple[str, ...]]) -> list[str
 def _add_docx_table(document: Any, headers: list[str], rows: list[tuple[str, ...]]) -> None:
     table = document.add_table(rows=1, cols=len(headers))
     table.style = "Table Grid"
-    for cell, heading in zip(table.rows[0].cells, headers):
+    if headers:
+        table.rows[0].cells[0].text = str(headers[0])
+    if len(headers) > 1:
+        table.rows[0].cells[1].text = str(headers[1])
+    for cell, heading in zip(table.rows[0].cells[2:], headers[2:]):
         cell.text = str(heading)
     for row in rows:
         cells = table.add_row().cells
