@@ -12,6 +12,7 @@ from statsmodels.formula.api import ols
 from statsmodels.stats.anova import anova_lm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import bot as bot_module
 from bot import (
     _detect_singleton_factor,
     _multivariate_table_route,
@@ -152,6 +153,30 @@ def telegram_regression_failures():
             failures.append("YES Results Document prompt was not sent")
         if len(bot.photos) != 1 or not bot.photos[0][1]:
             failures.append("chart PNG was not delivered as a Telegram photo")
+    return failures
+
+
+def telegram_token_startup_failures():
+    """Protect actionable startup diagnostics when TeleBot rejects a token."""
+    original_telebot = bot_module.telebot
+
+    class FakeTelebot:
+        @staticmethod
+        def TeleBot(token):
+            raise ValueError("Token must contain a colon")
+
+    failures = []
+    bot_module.telebot = FakeTelebot
+    try:
+        try:
+            bot_module._create_telegram_bot("not-a-token")
+        except SystemExit as exc:
+            if "TELEGRAM_BOT_TOKEN is malformed" not in str(exc):
+                failures.append(f"malformed token diagnostic was {exc}")
+        else:
+            failures.append("malformed token did not stop startup")
+    finally:
+        bot_module.telebot = original_telebot
     return failures
 
 
@@ -566,6 +591,7 @@ def main():
     fails.extend(chart_regression_failures())
     fails.extend(reporting_regression_failures())
     fails.extend(telegram_regression_failures())
+    fails.extend(telegram_token_startup_failures())
 
     if fails:
         print("FAIL")

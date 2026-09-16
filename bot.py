@@ -1699,6 +1699,16 @@ def _validate_telegram_bot(bot: Any, token: str) -> None:
         ) from exc
 
 
+def _create_telegram_bot(token: str) -> Any:
+    try:
+        return telebot.TeleBot(token)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(
+            "TELEGRAM_BOT_TOKEN is malformed. Copy the current token from @BotFather "
+            "into Render without quotes or whitespace."
+        ) from exc
+
+
 def _summary_line(result: dict[str, Any]) -> str:
     test = result.get("test", "")
     outcome = result.get("parameter") or result.get("outcome") or "Measured outcome"
@@ -1749,7 +1759,7 @@ def main() -> None:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN in Secrets.")
     if telebot is None:
         raise SystemExit("Install pyTelegramBotAPI from requirements.txt.")
-    bot = telebot.TeleBot(token)
+    bot = _create_telegram_bot(token)
     _validate_telegram_bot(bot, token)
     polling_lock = _acquire_polling_lock(token)
     if polling_lock is None:
