@@ -1679,6 +1679,26 @@ def _acquire_polling_lock(token: str):
     return lock_file
 
 
+def _validate_telegram_bot(bot: Any, token: str) -> None:
+    if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", token):
+        raise SystemExit(
+            "TELEGRAM_BOT_TOKEN is malformed. Copy the current token from @BotFather "
+            "into Render without quotes or whitespace."
+        )
+    try:
+        bot.get_me()
+    except Exception as exc:
+        if getattr(exc, "error_code", None) == 401 or getattr(exc, "status_code", None) == 401:
+            raise SystemExit(
+                "Telegram rejected TELEGRAM_BOT_TOKEN (401 Unauthorized). "
+                "Generate a new token with @BotFather, update the Render secret, and redeploy."
+            ) from exc
+        raise SystemExit(
+            f"Telegram token preflight failed with {type(exc).__name__}. "
+            "Check Render networking and Telegram availability."
+        ) from exc
+
+
 def _summary_line(result: dict[str, Any]) -> str:
     test = result.get("test", "")
     outcome = result.get("parameter") or result.get("outcome") or "Measured outcome"
@@ -1724,16 +1744,17 @@ def _p(value: Any) -> str:
 
 
 def main() -> None:
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     if not token:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN in Secrets.")
     if telebot is None:
         raise SystemExit("Install pyTelegramBotAPI from requirements.txt.")
+    bot = telebot.TeleBot(token)
+    _validate_telegram_bot(bot, token)
     polling_lock = _acquire_polling_lock(token)
     if polling_lock is None:
         print("Telegram bot already polling this token; exiting.", flush=True)
         return
-    bot = telebot.TeleBot(token)
     pending: dict[int, dict[str, str]] = {}
     pending_multivariate: dict[int, dict[str, Any]] = {}
     user_sessions: dict[int, dict[str, Any]] = {}
