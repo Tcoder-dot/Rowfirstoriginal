@@ -8,6 +8,8 @@ from pathlib import Path
 from threading import Thread
 from typing import Any
 
+from pandas.api.types import is_numeric_dtype
+
 try:
     import telebot
     from telebot import types
@@ -54,7 +56,7 @@ def _start_health_server() -> None:
 def _choose_columns(frame: Any) -> tuple[str, str]:
     if len(frame.columns) < 2:
         raise DataParserError("The table must contain a factor and metric column")
-    numeric = [column for column in frame.columns if str(frame[column].dtype) != "object"]
+    numeric = [column for column in frame.columns if is_numeric_dtype(frame[column])]
     metric = numeric[0] if numeric else frame.columns[1]
     factor = next((column for column in frame.columns if column != metric), frame.columns[0])
     return str(factor), str(metric)

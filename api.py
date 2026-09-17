@@ -6,6 +6,7 @@ import os
 import secrets
 from typing import Any
 
+from pandas.api.types import is_numeric_dtype
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -19,7 +20,9 @@ app = FastAPI(title="Rowfirst Analysis API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    # The browser rejects wildcard origins when credentialed cookies are enabled.
+    # This API authenticates with headers/form values, not browser cookies.
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -71,8 +74,8 @@ async def _verify_integration(request: Request) -> None:
 async def _analyze_request(
     file: UploadFile | None,
     raw_text: str | None,
-    factor_column: str,
-    metric_column: str,
+    factor_column: str | None,
+    metric_column: str | None,
 ) -> dict[str, Any]:
     if file is not None:
         frame = parse_csv_buffer(await file.read(), file.filename or "")
@@ -80,7 +83,18 @@ async def _analyze_request(
         frame = parse_tabular_text(raw_text)
     else:
         raise DataParserError("Provide a CSV file or raw_text")
+    if not factor_column or not metric_column:
+        factor_column, metric_column = _choose_columns(frame)
     return analyze_dataframe(frame, factor_column, metric_column)
+
+
+def _choose_columns(frame: Any) -> tuple[str, str]:
+    if len(frame.columns) < 2:
+        raise DataParserError("The table must contain a factor and metric column")
+    numeric = [column for column in frame.columns if is_numeric_dtype(frame[column])]
+    metric = numeric[0] if numeric else frame.columns[1]
+    factor = next((column for column in frame.columns if column != metric), frame.columns[0])
+    return str(factor), str(metric)
 
 
 def _public_engine(engine: dict[str, Any]) -> dict[str, Any]:
@@ -91,8 +105,8 @@ def _public_engine(engine: dict[str, Any]) -> dict[str, Any]:
 async def analyze(
     file: UploadFile | None = File(default=None),
     raw_text: str | None = Form(default=None),
-    factor_column: str = Form(...),
-    metric_column: str = Form(...),
+    factor_column: str | None = Form(default=None),
+    metric_column: str | None = Form(default=None),
     response_format: str = Form(default="docx"),
     _: None = Depends(_verify_integration),
 ) -> StreamingResponse | JSONResponse:

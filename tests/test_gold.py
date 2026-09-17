@@ -128,3 +128,19 @@ def test_public_api_accepts_form_query_and_bearer_credentials() -> None:
         headers={"X-Rowfirst-Client-Id": "demo-id", "Rowfirst-Secret-Key": "demo-secret"},
     )
     assert alias_header_response.status_code == 200
+
+
+def test_public_api_infers_columns_when_not_supplied() -> None:
+    os.environ["ROWFIRST_ID"] = "demo-id"
+    os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"
+    response = TestClient(app).post(
+        "/api/v1/analyze",
+        data={
+            "raw_text": "Treatment,Value\nA,1\nA,2\nB,4\nB,5\n",
+            "response_format": "json",
+        },
+        headers={"X-Rowfirst-Id": "demo-id", "X-Rowfirst-Secret-Key": "demo-secret"},
+    )
+    assert response.status_code == 200
+    assert response.json()["factor"] == "Treatment"
+    assert response.json()["metric"] == "Value"
