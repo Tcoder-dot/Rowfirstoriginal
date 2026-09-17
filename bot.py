@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import os
 import tempfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from typing import Any
 
 try:
@@ -22,6 +24,31 @@ UNSUPPORTED_MEDIA_MESSAGE = (
     "Please send a .csv file or paste your raw data text."
 )
 last_engines: dict[int, dict[str, Any]] = {}
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+
+def _start_health_server() -> None:
+    raw_port = os.getenv("PORT")
+    if not raw_port:
+        return
+    try:
+        port = int(raw_port)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid PORT value: {raw_port!r}") from exc
+    if port <= 0:
+        raise RuntimeError(f"Invalid PORT value: {raw_port!r}")
+    server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
+    Thread(target=server.serve_forever, daemon=True).start()
 
 
 def _choose_columns(frame: Any) -> tuple[str, str]:
@@ -113,6 +140,7 @@ def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("Set TELEGRAM_BOT_TOKEN before starting the Telegram client")
+    _start_health_server()
     create_bot(token).infinity_polling(skip_pending=True)
 
 
