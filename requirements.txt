@@ -4,6 +4,10 @@ statsmodels
 pandas
 openpyxl
 xlrd
+pypdf
+Pillow
+pytesseract
+pymupdf
 matplotlib
 python-docx
 pyTelegramBotAPI

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import base64
+from io import BytesIO
 import tempfile
 import zipfile
 from pathlib import Path
@@ -12,7 +13,15 @@ from fastapi.testclient import TestClient
 
 from analysis_service import analyze_dataframe, generate_docx
 from api import app
-from data_parser import DataParserError, parse_csv_buffer, parse_image, parse_pdf, parse_tabular_text
+from data_parser import (
+    DataParserError,
+    parse_csv_buffer,
+    parse_excel_buffer,
+    parse_image,
+    parse_pdf,
+    parse_tabular_text,
+    parse_uploaded_file,
+)
 from handle import build_breakdown
 
 
@@ -158,14 +167,32 @@ def test_large_batch_narrative_summarizes_non_significant_metrics() -> None:
     assert "Metric_10: group means were not reported" not in discussion
 
 
-def test_unsupported_inputs_are_explicit() -> None:
-    for parser in (parse_pdf, parse_image):
-        try:
-            parser(b"data")
-        except NotImplementedError as exc:
-            assert str(exc) == "PDF and Image parsing are scheduled for v2.0"
-        else:
-            raise AssertionError("unsupported parser did not raise")
+def test_excel_and_pdf_uploads_are_parsed() -> None:
+    excel_buffer = BytesIO()
+    pd.DataFrame({"Treatment": ["A", "A", "B", "B"], "Value": [1, 2, 4, 5]}).to_excel(excel_buffer, index=False)
+    excel = parse_excel_buffer(excel_buffer.getvalue(), "study.xlsx")
+    assert list(excel.columns) == ["Treatment", "Value"]
+    assert parse_uploaded_file(excel_buffer.getvalue(), "study.xlsx").shape == (4, 2)
+
+    from reportlab.pdfgen.canvas import Canvas
+
+    pdf_buffer = BytesIO()
+    pdf = Canvas(pdf_buffer)
+    for index, line in enumerate(("Treatment,Value", "A,1", "A,2", "B,4", "B,5")):
+        pdf.drawString(72, 760 - index * 16, line)
+    pdf.save()
+    parsed_pdf = parse_pdf(pdf_buffer.getvalue())
+    assert list(parsed_pdf.columns) == ["Treatment", "Value"]
+
+
+def test_image_upload_uses_ocr(monkeypatch) -> None:
+    from PIL import Image
+    import pytesseract
+
+    image_buffer = BytesIO()
+    Image.new("RGB", (120, 40), "white").save(image_buffer, format="PNG")
+    monkeypatch.setattr(pytesseract, "image_to_string", lambda *args, **kwargs: "Treatment,Value\nA,1\nB,2")
+    assert list(parse_image(image_buffer.getvalue()).columns) == ["Treatment", "Value"]
 
 
 def test_bad_table_is_rejected() -> None:

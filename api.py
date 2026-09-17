@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from analysis_service import analyze_dataframe, generate_docx
 from charts import make_chart_base64
-from data_parser import DataParserError, parse_csv_buffer, parse_tabular_text
+from data_parser import DataParserError, parse_tabular_text, parse_uploaded_file
 
 
 app = FastAPI(title="Rowfirst Analysis API", version="1.0.0")
@@ -79,7 +79,7 @@ async def _analyze_request(
     metric_column: str | None,
 ) -> tuple[list[dict[str, Any]], str]:
     if file is not None:
-        frame = parse_csv_buffer(await file.read(), file.filename or "")
+        frame = parse_uploaded_file(await file.read(), file.filename or "")
     elif raw_text:
         frame = parse_tabular_text(raw_text)
     else:

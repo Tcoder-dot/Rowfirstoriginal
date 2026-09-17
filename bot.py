@@ -18,12 +18,12 @@ except ImportError:  # pragma: no cover
     types = None
 
 from analysis_service import analyze_dataframe, generate_docx
-from data_parser import DataParserError, parse_csv_buffer, parse_tabular_text
+from data_parser import DataParserError, parse_tabular_text, parse_uploaded_file
 
 
 UNSUPPORTED_MEDIA_MESSAGE = (
-    "⚠️ PDF and Image scanning will be available in v2.0! "
-    "Please send a .csv file or paste your raw data text."
+    "⚠️ Unsupported file type. Please send CSV, Excel, PDF, PNG, JPG, WEBP, TIFF, "
+    "or BMP data, or paste your raw table text."
 )
 last_engines: dict[int, dict[str, Any]] = {}
 
@@ -113,12 +113,13 @@ def create_bot(token: str) -> Any:
     @bot.message_handler(func=lambda message: getattr(message, "content_type", "") in {"photo", "document"})
     def media(message: Any) -> None:
         filename = str(getattr(getattr(message, "document", None), "file_name", "") or "")
-        if getattr(message, "content_type", "") == "photo" or Path(filename).suffix.lower() != ".csv":
-            bot.reply_to(message, UNSUPPORTED_MEDIA_MESSAGE)
-            return
         try:
-            info = bot.get_file(message.document.file_id)
-            frame = parse_csv_buffer(bot.download_file(info.file_path), filename)
+            if getattr(message, "content_type", "") == "photo":
+                info = bot.get_file(message.photo[-1].file_id)
+                filename = "uploaded-image.jpg"
+            else:
+                info = bot.get_file(message.document.file_id)
+            frame = parse_uploaded_file(bot.download_file(info.file_path), filename)
             _analyze_and_send(bot, message, frame)
         except (DataParserError, ValueError) as exc:
             bot.reply_to(message, f"⚠️ {exc}")
