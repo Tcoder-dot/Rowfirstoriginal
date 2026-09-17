@@ -1,12 +1,15 @@
 """Regression checks for the deterministic service boundary."""
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 
 import pandas as pd
+from fastapi.testclient import TestClient
 
 from analysis_service import analyze_dataframe, generate_docx
+from api import app
 from data_parser import DataParserError, parse_csv_buffer, parse_image, parse_pdf, parse_tabular_text
 
 
@@ -50,3 +53,40 @@ def test_bad_table_is_rejected() -> None:
         pass
     else:
         raise AssertionError("invalid delimiter was accepted")
+
+
+def test_public_api_uses_shared_engine_and_docx_output() -> None:
+    os.environ["ROWFIRST_ID"] = "demo-id"
+    os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"
+    client = TestClient(app)
+    headers = {"X-Rowfirst-ID": "demo-id", "X-Rowfirst-Secret": "demo-secret"}
+
+    json_response = client.post(
+        "/api/v1/analyze",
+        data={
+            "raw_text": "Treatment\tValue\nA\t1\nA\t2\nB\t4\nB\t5\n",
+            "factor_column": "Treatment",
+            "metric_column": "Value",
+            "response_format": "json",
+        },
+        headers=headers,
+    )
+    assert json_response.status_code == 200
+    payload = json_response.json()
+    assert payload["ok"] is True
+    assert payload["factor"] == "Treatment"
+    assert payload["metric"] == "Value"
+
+    docx_response = client.post(
+        "/api/v1/analyze",
+        data={
+            "raw_text": "Treatment\tValue\nA\t1\nA\t2\nB\t4\nB\t5\n",
+            "factor_column": "Treatment",
+            "metric_column": "Value",
+            "response_format": "docx",
+        },
+        headers=headers,
+    )
+    assert docx_response.status_code == 200
+    assert docx_response.headers["content-type"].startswith("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    assert len(docx_response.content) > 1000

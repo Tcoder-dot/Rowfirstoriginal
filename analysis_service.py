@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from io import BytesIO
 from pathlib import Path
 import re
 from typing import Any
@@ -60,9 +61,15 @@ def analyze_dataframe(
     return engine
 
 
-def generate_docx(engine: dict[str, Any], path: str | Path) -> str:
-    """Generate the existing DOCX report without framework dependencies."""
-    return write_docx(engine, path)
+def generate_docx(engine: dict[str, Any], path: str | Path | None = None) -> BytesIO | str:
+    """Generate a DOCX in memory, or write to a path for legacy callers."""
+    if path is not None:
+        return write_docx(engine, path)
+
+    buffer = BytesIO()
+    write_docx(engine, buffer)
+    buffer.seek(0)
+    return buffer
 
 
 def _clean_document_text(text: str) -> str:
@@ -123,12 +130,14 @@ def write_markdown(engine: dict[str, Any], path: str | Path) -> str:
     return str(destination)
 
 
-def write_docx(engine: dict[str, Any], path: str | Path) -> str:
+def write_docx(engine: dict[str, Any], path: str | Path | BytesIO) -> str | BytesIO:
     from docx import Document
 
     _require_engine(engine)
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination = path
+    if isinstance(destination, (str, Path)):
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
     results = _results(engine)
     document = Document()
     document.add_heading(_clean_document_text(TITLE), level=1)
@@ -175,7 +184,7 @@ def write_docx(engine: dict[str, Any], path: str | Path) -> str:
     for paragraph in _discussion(engine):
         document.add_paragraph(paragraph)
     document.save(destination)
-    return str(destination)
+    return str(destination) if isinstance(destination, Path) else destination
 
 
 def write_pdf(engine: dict[str, Any], path: str | Path) -> str:

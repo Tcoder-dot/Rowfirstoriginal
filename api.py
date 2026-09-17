@@ -1,16 +1,14 @@
 """Standalone REST API for deterministic tabular analysis."""
 from __future__ import annotations
 
-import tempfile
+from io import BytesIO
 import os
 import secrets
-from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from starlette.background import BackgroundTask
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from analysis_service import analyze_dataframe, generate_docx
 from data_parser import DataParserError, parse_csv_buffer, parse_tabular_text
@@ -22,7 +20,7 @@ cors_origins = [
     origin.strip()
     for origin in os.getenv(
         "ROWFIRST_CORS_ORIGINS",
-        "http://localhost:3000,http://localhost:5173",
+        "http://localhost:3000,http://localhost:5173,https://rowfirst.top,https://www.rowfirst.top",
     ).split(",")
     if origin.strip()
 ]
@@ -33,6 +31,11 @@ app.add_middleware(
     allow_methods=["POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def internal_engine_error(_, __: Exception) -> JSONResponse:
+    return JSONResponse(status_code=500, content={"detail": "Internal Engine Error"})
 
 
 def _verify_integration(
@@ -71,7 +74,7 @@ def _public_engine(engine: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in engine.items() if key != "source_frame"}
 
 
-@app.post("/api/v1/analyze")
+@app.post("/api/v1/analyze", response_model=None)
 async def analyze(
     file: UploadFile | None = File(default=None),
     raw_text: str | None = Form(default=None),
@@ -79,25 +82,22 @@ async def analyze(
     metric_column: str = Form(...),
     response_format: str = Form(default="docx"),
     _: None = Depends(_verify_integration),
-) -> FileResponse | JSONResponse:
+) -> StreamingResponse | JSONResponse:
     try:
         engine = await _analyze_request(file, raw_text, factor_column, metric_column)
         if response_format.lower() == "json":
             return JSONResponse(content=_public_engine(engine))
         if response_format.lower() != "docx":
             raise DataParserError("response_format must be 'docx' or 'json'")
-        with tempfile.NamedTemporaryFile(
-            prefix="rowfirst-results-",
-            suffix=".docx",
-            delete=False,
-        ) as temporary_file:
-            output = Path(temporary_file.name)
-        generate_docx(engine, output)
-        return FileResponse(
-            output,
+        buffer = generate_docx(engine)
+        if not isinstance(buffer, BytesIO):
+            raise RuntimeError("DOCX generator returned an invalid buffer")
+        buffer.seek(0)
+        headers = {"Content-Disposition": 'attachment; filename="Rowfirst_Results.docx"'}
+        return StreamingResponse(
+            buffer,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            filename="Rowfirst_Results.docx",
-            background=BackgroundTask(output.unlink, missing_ok=True),
+            headers=headers,
         )
     except (DataParserError, ValueError, KeyError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
