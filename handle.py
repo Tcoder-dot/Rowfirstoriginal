@@ -575,9 +575,9 @@ def _breakdown_sample_caveat(results: list[dict[str, Any]]) -> str:
         return power
     sample = _breakdown_sample_once(results)
     if sample == "sample size was not reported":
-        return "n caveat: sample size was not reported."
+        return "Sample-size caveat: sample size was not reported."
     if _has_small_group_sample(results):
-        return f"n caveat: {sample}; this is a small sample, not a huge trial."
+        return f"Sample-size caveat: {sample}; this is a small sample, not a huge trial."
     return f"Sample size: {sample}; the cohort is adequately powered, robust, and substantial."
 
 

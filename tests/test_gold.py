@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from analysis_service import analyze_dataframe, generate_docx
 from api import app
 from data_parser import DataParserError, parse_csv_buffer, parse_image, parse_pdf, parse_tabular_text
+from handle import build_breakdown
 
 
 def test_parser_delimiters() -> None:
@@ -25,6 +26,8 @@ def test_labeled_text_and_analysis() -> None:
     assert engine["ok"] is True
     assert engine["factor"] == "Factor"
     assert engine["metric"] == "Metric"
+    assert "n caveat" not in engine["breakdown"]
+    assert "Sample-size caveat:" in engine["breakdown"]
 
 
 def test_docx_generation() -> None:
