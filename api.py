@@ -6,7 +6,7 @@ import os
 import secrets
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -16,20 +16,13 @@ from data_parser import DataParserError, parse_csv_buffer, parse_tabular_text
 
 app = FastAPI(title="Rowfirst Analysis API", version="1.0.0")
 
-cors_origins = [
-    origin.strip()
-    for origin in os.getenv(
-        "ROWFIRST_CORS_ORIGINS",
-        "http://localhost:3000,http://localhost:5173,https://rowfirst.top,https://www.rowfirst.top",
-    ).split(",")
-    if origin.strip()
-]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_credentials=False,
-    allow_methods=["POST", "OPTIONS"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 
@@ -38,10 +31,30 @@ async def internal_engine_error(_, __: Exception) -> JSONResponse:
     return JSONResponse(status_code=500, content={"detail": "Internal Engine Error"})
 
 
-def _verify_integration(
-    rowfirst_id: str | None = Header(default=None, alias="X-Rowfirst-ID"),
-    secret_key: str | None = Header(default=None, alias="X-Rowfirst-Secret"),
-) -> None:
+async def _verify_integration(request: Request) -> None:
+    form = await request.form()
+    headers = request.headers
+    rowfirst_id = (
+        headers.get("X-Rowfirst-Id")
+        or headers.get("X-Rowfirst-ID")
+        or headers.get("Rowfirst-Id")
+        or headers.get("X-Rowfirst-Client-Id")
+        or form.get("rowfirst_id")
+        or request.query_params.get("rowfirst_id")
+    )
+    secret_key = (
+        headers.get("X-Rowfirst-Secret-Key")
+        or headers.get("X-Rowfirst-Secret")
+        or headers.get("Rowfirst-Secret-Key")
+        or form.get("rowfirst_secret_key")
+        or request.query_params.get("rowfirst_secret_key")
+    )
+    if not secret_key:
+        authorization = headers.get("Authorization", "")
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer":
+            secret_key = token.strip() or None
+
     expected_id = os.getenv("ROWFIRST_ID")
     expected_secret = os.getenv("ROWFIRST_SECRET_KEY")
     if not expected_id or not expected_secret:

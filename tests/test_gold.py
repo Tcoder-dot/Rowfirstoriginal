@@ -90,3 +90,41 @@ def test_public_api_uses_shared_engine_and_docx_output() -> None:
     assert docx_response.status_code == 200
     assert docx_response.headers["content-type"].startswith("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     assert len(docx_response.content) > 1000
+
+
+def test_public_api_accepts_form_query_and_bearer_credentials() -> None:
+    os.environ["ROWFIRST_ID"] = "demo-id"
+    os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"
+    client = TestClient(app)
+    request_data = {
+        "raw_text": "Treatment\tValue\nA\t1\nA\t2\nB\t4\nB\t5\n",
+        "factor_column": "Treatment",
+        "metric_column": "Value",
+        "response_format": "json",
+    }
+
+    form_response = client.post(
+        "/api/v1/analyze",
+        data={**request_data, "rowfirst_id": "demo-id", "rowfirst_secret_key": "demo-secret"},
+    )
+    assert form_response.status_code == 200
+
+    query_response = client.post(
+        "/api/v1/analyze?rowfirst_id=demo-id&rowfirst_secret_key=demo-secret",
+        data=request_data,
+    )
+    assert query_response.status_code == 200
+
+    bearer_response = client.post(
+        "/api/v1/analyze",
+        data={**request_data, "rowfirst_id": "demo-id"},
+        headers={"Authorization": "Bearer demo-secret"},
+    )
+    assert bearer_response.status_code == 200
+
+    alias_header_response = client.post(
+        "/api/v1/analyze",
+        data=request_data,
+        headers={"X-Rowfirst-Client-Id": "demo-id", "Rowfirst-Secret-Key": "demo-secret"},
+    )
+    assert alias_header_response.status_code == 200
