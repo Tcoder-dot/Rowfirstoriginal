@@ -76,15 +76,22 @@ async def _analyze_request(
     raw_text: str | None,
     factor_column: str | None,
     metric_column: str | None,
-) -> dict[str, Any]:
+) -> tuple[list[dict[str, Any]], str]:
     if file is not None:
         frame = parse_csv_buffer(await file.read(), file.filename or "")
     elif raw_text:
         frame = parse_tabular_text(raw_text)
     else:
         raise DataParserError("Provide a CSV file or raw_text")
-    factor_column, metric_column = _infer_columns(frame, factor_column, metric_column)
-    return analyze_dataframe(frame, factor_column, metric_column)
+    factor_column = _infer_factor_column(frame, factor_column)
+    metric_columns = (
+        [str(metric_column)]
+        if metric_column and metric_column.upper() != "ALL"
+        else _numeric_metric_columns(frame, factor_column)
+    )
+    if not metric_columns:
+        raise DataParserError("Could not find any numeric metric columns")
+    return [analyze_dataframe(frame, factor_column, metric) for metric in metric_columns], factor_column
 
 
 def _infer_columns(
@@ -95,19 +102,7 @@ def _infer_columns(
     if len(frame.columns) < 2:
         raise DataParserError("The table must contain a factor and metric column")
 
-    if not factor_column:
-        ignored_factor_names = ("id", "record", "index")
-        half_row_count = len(frame) * 0.5
-        factor_column = next(
-            (
-                str(column)
-                for column in frame.columns
-                if not any(term in str(column).lower() for term in ignored_factor_names)
-                and (is_object_dtype(frame[column]) or is_string_dtype(frame[column]))
-                and frame[column].nunique(dropna=True) < half_row_count
-            ),
-            None,
-        )
+    factor_column = _infer_factor_column(frame, factor_column)
     if not factor_column:
         raise DataParserError(
             "Could not infer a categorical factor column with fewer than half as many unique values as rows"
@@ -127,6 +122,52 @@ def _infer_columns(
     return str(factor_column), str(metric_column)
 
 
+def _infer_factor_column(frame: Any, factor_column: str | None = None) -> str:
+    if len(frame.columns) < 2:
+        raise DataParserError("The table must contain a factor and metric column")
+    if factor_column:
+        if factor_column not in frame.columns:
+            raise DataParserError(f"Unknown factor column: {factor_column}")
+        return str(factor_column)
+    ignored_factor_names = ("id", "record", "index")
+    half_row_count = len(frame) * 0.5
+    inferred = next(
+        (
+            str(column)
+            for column in frame.columns
+            if not any(term in str(column).lower() for term in ignored_factor_names)
+            and (is_object_dtype(frame[column]) or is_string_dtype(frame[column]))
+            and frame[column].nunique(dropna=True) < half_row_count
+        ),
+        None,
+    )
+    if not inferred:
+        raise DataParserError(
+            "Could not infer a categorical factor column with fewer than half as many unique values as rows"
+        )
+    return inferred
+
+
+def _numeric_metric_columns(frame: Any, factor_column: str) -> list[str]:
+    return [
+        str(column)
+        for column in frame.columns
+        if str(column) != factor_column and is_numeric_dtype(frame[column])
+    ]
+
+
+def _analysis_payload(engine: dict[str, Any]) -> dict[str, Any]:
+    result = engine["result"]
+    return {
+        "metric": engine.get("metric"),
+        "status": engine.get("status", "success"),
+        "result_text": engine.get("message", ""),
+        "result": result,
+        "chart_base64": engine.get("chart_base64"),
+        **({"reason": engine["reason"], "descriptive_stats": engine["descriptive_stats"]} if engine.get("status") == "fallback" else {}),
+    }
+
+
 def _public_engine(engine: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in engine.items() if key != "source_frame"}
 
@@ -141,11 +182,19 @@ async def analyze(
     _: None = Depends(_verify_integration),
 ) -> StreamingResponse | JSONResponse:
     try:
-        engine = await _analyze_request(file, raw_text, factor_column, metric_column)
+        engines, factor = await _analyze_request(file, raw_text, factor_column, metric_column)
         if response_format.lower() == "json":
-            return JSONResponse(content=_public_engine(engine))
+            analyses = [_analysis_payload(engine) for engine in engines]
+            payload: dict[str, Any] = {"analyses": analyses, "factor": factor}
+            if len(analyses) == 1:
+                payload.update(_public_engine(engines[0]))
+            return JSONResponse(content=payload)
         if response_format.lower() != "docx":
             raise DataParserError("response_format must be 'docx' or 'json'")
+        engine = dict(engines[0])
+        engine["results"] = [item["result"] for item in engines]
+        engine["result"] = engine["results"][0]
+        engine["factor"] = factor
         buffer = generate_docx(engine)
         if not isinstance(buffer, BytesIO):
             raise RuntimeError("DOCX generator returned an invalid buffer")

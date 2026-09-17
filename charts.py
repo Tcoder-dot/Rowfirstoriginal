@@ -84,7 +84,7 @@ def _render_chart(
     fig = None
     caption = ""
 
-    if test in {"student-t", "welch-t", "one-way anova"}:
+    if test in {"student-t", "welch-t", "one-way anova", "descriptive fallback"}:
         groups = _result_groups(result)
         if len(groups) >= 2:
             fig = _bar_figure(groups, f"{outcome}: group means ± SD")

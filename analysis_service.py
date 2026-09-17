@@ -19,6 +19,7 @@ from stats_engine import (
     linear_regression,
     paired_ttest,
     two_way_anova,
+    describe_group,
 )
 
 
@@ -54,7 +55,43 @@ def analyze_dataframe(
     }
     from handle import analyze_ingested, build_breakdown
 
-    engine = analyze_ingested(ingested, outcome_name=str(metric_column))
+    try:
+        if any(len(group["values"]) < 2 for group in groups):
+            raise ValueError("insufficient group sizes for inferential testing")
+        if len(groups) >= 2 and all(
+            len(set(group["values"])) == 1 for group in groups
+        ):
+            raise ValueError("zero within-group variance")
+        engine = analyze_ingested(ingested, outcome_name=str(metric_column))
+    except ValueError as exc:
+        reason = "zero_variance" if "variance" in str(exc).lower() else "insufficient_group_sizes"
+        descriptive_groups = [describe_group(group["name"], group["values"]) for group in groups]
+        result = {
+            "test": "descriptive fallback",
+            "outcome": str(metric_column),
+            "groups": descriptive_groups,
+            "status": "fallback",
+            "reason": reason,
+            "descriptive_stats": {
+                group["name"]: {
+                    "n": group["n"],
+                    "mean": group["mean"],
+                    "median": group["median"],
+                    "std_dev": group["sd"],
+                }
+                for group in descriptive_groups
+            },
+        }
+        engine = {
+            "ok": True,
+            "ingested": ingested,
+            "results": [result],
+            "result": result,
+            "message": (
+                f"Inferential analysis was unavailable for {metric_column}; "
+                "descriptive statistics are reported instead."
+            ),
+        }
     engine["qa"] = quality_check(ingested)
     engine["breakdown"] = build_breakdown(engine)
     engine["factor"] = str(factor_column)
@@ -63,6 +100,11 @@ def analyze_dataframe(
     chart_base64 = make_chart_base64(engine)
     if chart_base64:
         engine["chart_base64"] = chart_base64
+        engine["result"]["chart_base64"] = chart_base64
+    if engine["result"].get("status") == "fallback":
+        engine["status"] = "fallback"
+        engine["reason"] = engine["result"]["reason"]
+        engine["descriptive_stats"] = engine["result"]["descriptive_stats"]
     return engine
 
 
@@ -498,7 +540,7 @@ def _descriptive_rows(result: dict[str, Any]) -> list[tuple[str, str, str, str, 
     test = result.get("test")
     if test in {"student-t", "welch-t"}:
         return [_group_row(result["group1"]), _group_row(result["group2"])]
-    if test == "one-way anova":
+    if test in {"one-way anova", "descriptive fallback"}:
         return [_group_row(group) for group in result.get("groups", [])]
     if test == "paired-t":
         return [_group_row(result["before"]), _group_row(result["after"])]
@@ -536,6 +578,8 @@ def _inferential_rows(results: list[dict[str, Any]]) -> list[tuple[str, str, str
             ))
         elif test == "one-way anova":
             rows.append((name, "One-way ANOVA", f"F = {result['F']:.12g}", f"{result['dfb']}, {result['dfw']}", _fmt_p(result["p"]), _decision(result.get("isSignificant", False))))
+        elif test == "descriptive fallback":
+            rows.append((name, "Descriptive fallback", "not calculated", "—", "—", result.get("reason", "not calculated")))
         elif test == "two-way anova":
             effects = result.get("effects", [])
             rows.append((
@@ -562,6 +606,12 @@ def _inferential_rows(results: list[dict[str, Any]]) -> list[tuple[str, str, str
 
 def _working_notes(result: dict[str, Any]) -> list[str]:
     test = result.get("test")
+    if test == "descriptive fallback":
+        return [
+            "Inferential testing was not calculated because the required variance or group-size conditions were not met.",
+            f"Reason: {result.get('reason', 'statistical assumptions were not met')}.",
+            "Descriptive statistics are reported without an F statistic or p-value.",
+        ]
     if test in {"student-t", "welch-t"}:
         return [
             f"Formula: {'Welch' if test == 'welch-t' else 'independent-samples'} t-test; n={result['group1']['n']} and n={result['group2']['n']}.",
@@ -653,6 +703,12 @@ def _discussion(engine: dict[str, Any]) -> list[str]:
 def _interpretation_clause(result: dict[str, Any]) -> str:
     label = _humanize_label(_outcome_name(result))
     test = result.get("test")
+    if test == "descriptive fallback":
+        return (
+            f"{label}: inferential testing was not calculated because "
+            f"{result.get('reason', 'the required assumptions were not met')}; "
+            "descriptive group statistics are reported instead."
+        )
     if test in {"student-t", "welch-t"}:
         groups = [result["group1"], result["group2"]]
         higher, lower = sorted(groups, key=lambda group: group["mean"], reverse=True)
@@ -1079,8 +1135,10 @@ def _add_docx_table(document: Any, headers: list[str], rows: list[tuple[str, ...
 
 def _embed_chart(document: Any, engine: dict[str, Any], result_index: int) -> None:
     """Embed the exact chart bytes returned in the engine payload."""
-    chart_base64 = engine.get("chart_base64")
-    if chart_base64 and result_index == 0:
+    results = _results(engine)
+    chart_base64 = results[result_index].get("chart_base64") if result_index < len(results) else None
+    chart_base64 = chart_base64 or (engine.get("chart_base64") if result_index == 0 else None)
+    if chart_base64:
         try:
             from docx.shared import Inches
 

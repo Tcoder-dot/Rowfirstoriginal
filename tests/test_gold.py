@@ -78,6 +78,36 @@ def test_engine_chart_is_returned_and_embedded_in_docx() -> None:
             assert chart_bytes in [archive.read(name) for name in media]
 
 
+def test_api_batch_returns_success_and_descriptive_fallbacks() -> None:
+    os.environ["ROWFIRST_ID"] = "demo-id"
+    os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"
+    text = """Record_ID,Teaching_Method,Exam_Score,ID_Number
+R01,A,85.2,1
+R02,A,88.5,1
+R03,A,86.1,1
+R04,B,72.4,2
+R05,B,75.1,2
+R06,B,71.8,2
+R07,C,92.5,3
+R08,C,94.1,3
+R09,C,91.8,3
+"""
+    response = TestClient(app).post(
+        "/api/v1/analyze",
+        data={"raw_text": text, "metric_column": "ALL", "response_format": "json"},
+        headers={"X-Rowfirst-Id": "demo-id", "X-Rowfirst-Secret-Key": "demo-secret"},
+    )
+    assert response.status_code == 200
+    analyses = response.json()["analyses"]
+    by_metric = {analysis["metric"]: analysis for analysis in analyses}
+    assert by_metric["Exam_Score"]["status"] == "success"
+    assert by_metric["Exam_Score"]["chart_base64"].startswith("iVBORw0KGgo")
+    assert by_metric["ID_Number"]["status"] == "fallback"
+    assert by_metric["ID_Number"]["reason"] == "zero_variance"
+    assert by_metric["ID_Number"]["descriptive_stats"]["A"]["mean"] == 1.0
+    assert by_metric["ID_Number"]["chart_base64"].startswith("iVBORw0KGgo")
+
+
 def test_unsupported_inputs_are_explicit() -> None:
     for parser in (parse_pdf, parse_image):
         try:
