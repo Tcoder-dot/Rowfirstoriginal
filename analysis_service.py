@@ -689,17 +689,55 @@ def _interpretations(engine: dict[str, Any]) -> list[str]:
     results = _results(engine)
     if not results:
         return ["The engine did not provide an interpretation."]
-    clauses = [_interpretation_clause(result) for result in results]
-    return [" ".join(clauses) + " " + _study_significance_sentence(results)]
+    narrative_results, omitted_results = _narrative_results(results)
+    clauses = [_interpretation_clause(result) for result in narrative_results]
+    text = " ".join(clauses) if clauses else "No statistically significant discoveries were identified in the tested variables."
+    text += " " + _study_significance_sentence(narrative_results or results)
+    if omitted_results:
+        text += " " + _summary_omitted_sentence(omitted_results)
+    return [text]
 
 
 def _discussion(engine: dict[str, Any]) -> list[str]:
     results = _results(engine)
     if not results:
         return ["No discussion was produced because the engine returned no result."]
+    narrative_results, omitted_results = _narrative_results(results)
     topic = str(engine.get("topic") or "").strip()
-    synthesis = _synthesis_paragraph(results, topic)
-    return [synthesis, _discussion_limits(results)]
+    synthesis_results = narrative_results or results
+    synthesis = _synthesis_paragraph(synthesis_results, topic)
+    discussion = [synthesis]
+    if omitted_results:
+        discussion.append(_summary_omitted_sentence(omitted_results))
+    discussion.append(_discussion_limits(synthesis_results))
+    return discussion
+
+
+def _narrative_results(results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep full tables, but summarize non-discoveries in large batches."""
+    if len(results) <= 10:
+        return results, []
+    significant = [result for result in results if _result_is_significant(result)]
+    omitted = [result for result in results if result not in significant]
+    return significant, omitted
+
+
+def _result_is_significant(result: dict[str, Any]) -> bool:
+    if result.get("test") == "two-way anova":
+        return any(float(effect.get("p", 1.0)) < 0.05 for effect in result.get("effects", []))
+    p_value = result.get("p")
+    return isinstance(p_value, (int, float)) and float(p_value) < 0.05
+
+
+def _summary_omitted_sentence(results: list[dict[str, Any]]) -> str:
+    labels = [_humanize_label(_outcome_name(result)) for result in results]
+    preview = _join_items(labels[:2])
+    if len(labels) > 2:
+        preview += ", and others"
+    return (
+        f"No significant differences were observed for {len(results)} other variables tested, "
+        f"including {preview} (all p > .05 or inferential testing was unavailable; see Table 4)."
+    )
 
 
 def _interpretation_clause(result: dict[str, Any]) -> str:

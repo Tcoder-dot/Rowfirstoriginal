@@ -127,6 +127,37 @@ def test_api_batch_limits_charts_for_large_batches() -> None:
     assert sum(analysis["chart_base64"] is not None for analysis in analyses) == 5
 
 
+def test_large_batch_narrative_summarizes_non_significant_metrics() -> None:
+    from analysis_service import _discussion, _interpretations
+
+    significant = {
+        "test": "one-way anova",
+        "outcome": "Discovery",
+        "p": 0.001,
+        "isSignificant": True,
+        "F": 12.0,
+        "dfb": 2,
+        "dfw": 9,
+        "groups": [],
+    }
+    non_significant = [
+        {"test": "one-way anova", "outcome": f"Metric_{index}", "p": 0.4, "isSignificant": False, "groups": []}
+        for index in range(11)
+    ]
+    engine = {
+        "ok": True,
+        "results": [significant, *non_significant],
+        "result": significant,
+        "ingested": {"format": "long", "factor": "Treatment", "outcome": "Discovery", "groups": []},
+    }
+    interpretation = _interpretations(engine)[0]
+    discussion = " ".join(_discussion(engine))
+    assert "Discovery: group means were not reported" in interpretation
+    assert "No significant differences were observed for 11 other variables tested" in interpretation
+    assert "Metric_10: group means were not reported" not in interpretation
+    assert "Metric_10: group means were not reported" not in discussion
+
+
 def test_unsupported_inputs_are_explicit() -> None:
     for parser in (parse_pdf, parse_image):
         try:
