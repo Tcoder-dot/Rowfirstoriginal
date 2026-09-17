@@ -5,7 +5,9 @@ source of statistical numbers.
 """
 from __future__ import annotations
 
+import base64
 from pathlib import Path
+import tempfile
 from typing import Any
 
 import matplotlib
@@ -16,6 +18,22 @@ import numpy as np
 
 
 MAX_CHARTS = 6
+
+
+def make_chart_base64(engine: dict[str, Any]) -> str | None:
+    """Render the first outcome chart and return its PNG bytes as base64."""
+    results = _results(engine)
+    if not results:
+        return None
+    try:
+        with tempfile.TemporaryDirectory(prefix="rowfirst-chart-") as directory:
+            path = Path(directory) / "outcome-1.png"
+            chart = _render_chart(engine, results[0], path)
+            if chart is None or not path.is_file():
+                return None
+            return base64.b64encode(path.read_bytes()).decode("ascii")
+    except Exception:
+        return None
 
 
 def make_charts(

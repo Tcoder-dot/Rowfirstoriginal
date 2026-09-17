@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import os
+import base64
 import tempfile
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -30,6 +32,29 @@ def test_labeled_text_and_analysis() -> None:
     assert "Sample-size caveat:" in engine["breakdown"]
 
 
+def test_api_inference_skips_id_columns_and_requires_metric_variance() -> None:
+    from api import _infer_columns
+
+    frame = pd.DataFrame({
+        "Record_ID": [f"R{index:03d}" for index in range(20)],
+        "Teaching_Method": ["A"] * 10 + ["B"] * 10,
+        "Constant_Index": list(range(20)),
+        "Exam_Score": list(range(60, 80)),
+    })
+    assert _infer_columns(frame) == ("Teaching_Method", "Constant_Index")
+
+    frame["Constant_Index"] = 1
+    assert _infer_columns(frame) == ("Teaching_Method", "Exam_Score")
+
+    frame["Exam_Score"] = 1
+    try:
+        _infer_columns(frame)
+    except DataParserError as exc:
+        assert "non-zero variance" in str(exc)
+    else:
+        raise AssertionError("constant metrics should not be inferred")
+
+
 def test_docx_generation() -> None:
     frame = pd.DataFrame({"Treatment": ["A", "A", "B", "B"], "Value": [1, 2, 4, 5]})
     engine = analyze_dataframe(frame, "Treatment", "Value")
@@ -37,6 +62,20 @@ def test_docx_generation() -> None:
         path = Path(directory) / "results.docx"
         assert generate_docx(engine, path) == str(path)
         assert path.is_file()
+
+
+def test_engine_chart_is_returned_and_embedded_in_docx() -> None:
+    frame = pd.DataFrame({"Treatment": ["A", "A", "B", "B"], "Value": [1, 2, 4, 5]})
+    engine = analyze_dataframe(frame, "Treatment", "Value")
+    chart_bytes = base64.b64decode(engine["chart_base64"])
+    assert chart_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "results.docx"
+        generate_docx(engine, path)
+        with zipfile.ZipFile(path) as archive:
+            media = [name for name in archive.namelist() if name.startswith("word/media/")]
+            assert media
+            assert chart_bytes in [archive.read(name) for name in media]
 
 
 def test_unsupported_inputs_are_explicit() -> None:
@@ -139,7 +178,7 @@ def test_public_api_infers_columns_when_not_supplied() -> None:
     response = TestClient(app).post(
         "/api/v1/analyze",
         data={
-            "raw_text": "Treatment,Value\nA,1\nA,2\nB,4\nB,5\n",
+            "raw_text": "Treatment,Value\nA,1\nA,2\nA,3\nB,4\nB,5\nB,6\n",
             "response_format": "json",
         },
         headers={"X-Rowfirst-Id": "demo-id", "X-Rowfirst-Secret-Key": "demo-secret"},

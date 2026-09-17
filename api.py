@@ -6,7 +6,7 @@ import os
 import secrets
 from typing import Any
 
-from pandas.api.types import is_numeric_dtype
+from pandas.api.types import is_numeric_dtype, is_object_dtype, is_string_dtype
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -83,18 +83,48 @@ async def _analyze_request(
         frame = parse_tabular_text(raw_text)
     else:
         raise DataParserError("Provide a CSV file or raw_text")
-    if not factor_column or not metric_column:
-        factor_column, metric_column = _choose_columns(frame)
+    factor_column, metric_column = _infer_columns(frame, factor_column, metric_column)
     return analyze_dataframe(frame, factor_column, metric_column)
 
 
-def _choose_columns(frame: Any) -> tuple[str, str]:
+def _infer_columns(
+    frame: Any,
+    factor_column: str | None = None,
+    metric_column: str | None = None,
+) -> tuple[str, str]:
     if len(frame.columns) < 2:
         raise DataParserError("The table must contain a factor and metric column")
-    numeric = [column for column in frame.columns if is_numeric_dtype(frame[column])]
-    metric = numeric[0] if numeric else frame.columns[1]
-    factor = next((column for column in frame.columns if column != metric), frame.columns[0])
-    return str(factor), str(metric)
+
+    if not factor_column:
+        ignored_factor_names = ("id", "record", "index")
+        half_row_count = len(frame) * 0.5
+        factor_column = next(
+            (
+                str(column)
+                for column in frame.columns
+                if not any(term in str(column).lower() for term in ignored_factor_names)
+                and (is_object_dtype(frame[column]) or is_string_dtype(frame[column]))
+                and frame[column].nunique(dropna=True) < half_row_count
+            ),
+            None,
+        )
+    if not factor_column:
+        raise DataParserError(
+            "Could not infer a categorical factor column with fewer than half as many unique values as rows"
+        )
+
+    if not metric_column:
+        metric_column = next(
+            (
+                str(column)
+                for column in frame.columns
+                if is_numeric_dtype(frame[column]) and float(frame[column].var()) > 0
+            ),
+            None,
+        )
+    if not metric_column:
+        raise DataParserError("Could not infer a numeric metric column with non-zero variance")
+    return str(factor_column), str(metric_column)
 
 
 def _public_engine(engine: dict[str, Any]) -> dict[str, Any]:

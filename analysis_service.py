@@ -1,6 +1,7 @@
 """Results Document reports built only from the last verified engine JSON."""
 from __future__ import annotations
 
+import base64
 import math
 from io import BytesIO
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 
 import pandas as pd
 
+from charts import make_chart_base64
 from qa import quality_check
 from stats_engine import (
     analyze_groups,
@@ -58,6 +60,9 @@ def analyze_dataframe(
     engine["factor"] = str(factor_column)
     engine["metric"] = str(metric_column)
     engine["source_frame"] = selected
+    chart_base64 = make_chart_base64(engine)
+    if chart_base64:
+        engine["chart_base64"] = chart_base64
     return engine
 
 
@@ -1073,7 +1078,17 @@ def _add_docx_table(document: Any, headers: list[str], rows: list[tuple[str, ...
 
 
 def _embed_chart(document: Any, engine: dict[str, Any], result_index: int) -> None:
-    """Embed a matching chart when available; a missing PNG never blocks DOCX output."""
+    """Embed the exact chart bytes returned in the engine payload."""
+    chart_base64 = engine.get("chart_base64")
+    if chart_base64 and result_index == 0:
+        try:
+            from docx.shared import Inches
+
+            document.add_paragraph("Chart")
+            document.add_picture(BytesIO(base64.b64decode(chart_base64)), width=Inches(6.2))
+            return
+        except Exception:
+            pass
     chart = next(
         (
             item for item in (engine.get("charts") or [])
