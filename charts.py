@@ -34,6 +34,9 @@ def make_chart_base64(engine: dict[str, Any]) -> str | None:
             return base64.b64encode(path.read_bytes()).decode("ascii")
     except Exception:
         return None
+    finally:
+        plt.clf()
+        plt.close("all")
 
 
 def make_charts(

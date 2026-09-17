@@ -30,6 +30,7 @@ def analyze_dataframe(
     frame: pd.DataFrame,
     factor_column: str,
     metric_column: str,
+    generate_chart: bool = True,
 ) -> dict[str, Any]:
     """Run the existing deterministic engine against two selected columns."""
     if factor_column not in frame.columns or metric_column not in frame.columns:
@@ -97,10 +98,11 @@ def analyze_dataframe(
     engine["factor"] = str(factor_column)
     engine["metric"] = str(metric_column)
     engine["source_frame"] = selected
-    chart_base64 = make_chart_base64(engine)
-    if chart_base64:
-        engine["chart_base64"] = chart_base64
-        engine["result"]["chart_base64"] = chart_base64
+    if generate_chart:
+        chart_base64 = make_chart_base64(engine)
+        if chart_base64:
+            engine["chart_base64"] = chart_base64
+            engine["result"]["chart_base64"] = chart_base64
     if engine["result"].get("status") == "fallback":
         engine["status"] = "fallback"
         engine["reason"] = engine["result"]["reason"]

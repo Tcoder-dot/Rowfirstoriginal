@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from analysis_service import analyze_dataframe, generate_docx
+from charts import make_chart_base64
 from data_parser import DataParserError, parse_csv_buffer, parse_tabular_text
 
 
@@ -91,7 +92,36 @@ async def _analyze_request(
     )
     if not metric_columns:
         raise DataParserError("Could not find any numeric metric columns")
-    return [analyze_dataframe(frame, factor_column, metric) for metric in metric_columns], factor_column
+    engines = [
+        analyze_dataframe(frame, factor_column, metric, generate_chart=False)
+        for metric in metric_columns
+    ]
+    _add_ranked_batch_charts(engines)
+    return engines, factor_column
+
+
+def _add_ranked_batch_charts(engines: list[dict[str, Any]]) -> None:
+    """Render charts only for the most significant successful batch results."""
+    if len(engines) <= 1:
+        if engines:
+            chart_base64 = make_chart_base64(engines[0])
+            if chart_base64:
+                engines[0]["chart_base64"] = chart_base64
+                engines[0]["result"]["chart_base64"] = chart_base64
+        return
+
+    successful = [
+        engine for engine in engines
+        if engine.get("result", {}).get("status", "success") == "success"
+        and isinstance(engine.get("result", {}).get("p"), (int, float))
+    ]
+    chart_limit = 5 if len(engines) > 20 else 10
+    ranked = sorted(successful, key=lambda engine: float(engine["result"]["p"]))[:chart_limit]
+    for engine in ranked:
+        chart_base64 = make_chart_base64(engine)
+        if chart_base64:
+            engine["chart_base64"] = chart_base64
+            engine["result"]["chart_base64"] = chart_base64
 
 
 def _infer_columns(

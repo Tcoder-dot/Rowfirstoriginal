@@ -105,7 +105,26 @@ R09,C,91.8,3
     assert by_metric["ID_Number"]["status"] == "fallback"
     assert by_metric["ID_Number"]["reason"] == "zero_variance"
     assert by_metric["ID_Number"]["descriptive_stats"]["A"]["mean"] == 1.0
-    assert by_metric["ID_Number"]["chart_base64"].startswith("iVBORw0KGgo")
+    assert by_metric["ID_Number"]["chart_base64"] is None
+
+
+def test_api_batch_limits_charts_for_large_batches() -> None:
+    os.environ["ROWFIRST_ID"] = "demo-id"
+    os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"
+    headers = {"X-Rowfirst-Id": "demo-id", "X-Rowfirst-Secret-Key": "demo-secret"}
+    rows = ["Treatment," + ",".join(f"Metric_{index}" for index in range(21))]
+    for row_index, treatment in enumerate(("A", "B", "C") * 4):
+        values = [str(row_index + index * 0.01) for index in range(21)]
+        rows.append(f"{treatment}," + ",".join(values))
+    response = TestClient(app).post(
+        "/api/v1/analyze",
+        data={"raw_text": "\n".join(rows), "metric_column": "ALL", "response_format": "json"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    analyses = response.json()["analyses"]
+    assert len(analyses) == 21
+    assert sum(analysis["chart_base64"] is not None for analysis in analyses) == 5
 
 
 def test_unsupported_inputs_are_explicit() -> None:
