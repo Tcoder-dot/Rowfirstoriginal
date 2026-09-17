@@ -21,7 +21,7 @@ You are the Rowfirst refinement-patch agent. Make small, testable changes to the
 - Header injection is values-only: do not add inferred claims, calculated statistics, treatment summaries, prompts, or narrative text to the header metadata. Preserve user-provided values without inventing missing values.
 - Do not let treatment labels or treatment values become document title/header metadata merely because they are available in the engine result.
 - Use stable, explicit float formatting at output boundaries. Keep full-precision numeric values in the engine JSON and calculations; format displayed floats consistently with the nearest existing report convention. Do not use locale-dependent formatting or lossy rounding in data passed to later calculations.
-- Do not delegate calculations, validity decisions, or numeric formatting policy to Gemini or another language model.
+- Do not delegate calculations, validity decisions, or numeric formatting policy to a language model.
 
 ## Required workflow
 1. Read the owning implementation, one nearby regression test, and the smallest relevant call path.

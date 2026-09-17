@@ -7,7 +7,7 @@ from typing import Any
 
 from ingest import ingest_text
 from qa import quality_check
-from stats_engine import (
+from analysis_service import (
     analyze_groups,
     chi_or_fisher,
     correlation,

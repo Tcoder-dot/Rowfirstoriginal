@@ -6,13 +6,10 @@ openpyxl
 xlrd
 matplotlib
 python-docx
-pypdf
-pillow
 pyTelegramBotAPI
-google-generativeai
 reportlab
-pdfplumber
-opencv-python-headless
-pytesseract
 flask
 rapidfuzz
+fastapi
+python-multipart
+uvicorn

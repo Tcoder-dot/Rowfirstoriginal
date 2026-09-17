@@ -11,7 +11,7 @@ Telegram-based research analysis bot that runs verified statistical tests, creat
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
 - Required env: `DATABASE_URL` — Postgres connection string
 - `python3 tests/test_gold.py` — verify the SciPy gold outputs and reporting resilience
-- `python3 bot.py` — start Telegram polling; requires `TELEGRAM_BOT_TOKEN` and `GEMINI_API_KEY` in Secrets
+- `python3 bot.py` — start Telegram polling; requires `TELEGRAM_BOT_TOKEN` in Secrets
 
 ## Stack
 
@@ -49,7 +49,7 @@ _Populate as you build — explicit user instructions worth remembering across s
 ## Gotchas
 
 - Only one Telegram polling process may run for the bot token at a time.
-- Never hardcode or print `TELEGRAM_BOT_TOKEN` or `GEMINI_API_KEY`.
+- Never hardcode or print `TELEGRAM_BOT_TOKEN` or payment secrets.
 - Do not rewrite SciPy/statistical engine logic while changing reporting language.
 
 ## Pointers
