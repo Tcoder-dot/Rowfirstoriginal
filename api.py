@@ -16,6 +16,16 @@ from charts import make_chart_base64
 from data_parser import DataParserError, parse_tabular_text, parse_uploaded_file
 
 
+IDENTIFIER_COLUMNS = {
+    "id", "rowid", "recordid", "uuid", "index", "sampleid", "idnumber",
+    "identifier", "rownumber", "recordnumber", "recordcode",
+}
+GROUP_COLUMN_HINTS = {
+    "treatment", "group", "groups", "arm", "method", "methods", "condition",
+    "department", "category", "type", "variant", "segment", "region", "cohort",
+}
+
+
 app = FastAPI(title="Rowfirst Analysis API", version="1.0.0")
 
 app.add_middleware(
@@ -72,18 +82,34 @@ async def _verify_integration(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid Rowfirst integration credentials")
 
 
-async def _analyze_request(
+async def _load_frame(
     file: UploadFile | None,
     raw_text: str | None,
-    factor_column: str | None,
-    metric_column: str | None,
-) -> tuple[list[dict[str, Any]], str]:
+) -> Any:
     if file is not None:
         frame = parse_uploaded_file(await file.read(), file.filename or "")
     elif raw_text:
         frame = parse_tabular_text(raw_text)
     else:
         raise DataParserError("Provide a CSV file or raw_text")
+    return frame
+
+
+async def _analyze_request(
+    file: UploadFile | None,
+    raw_text: str | None,
+    factor_column: str | None,
+    metric_column: str | None,
+) -> tuple[list[dict[str, Any]], str]:
+    frame = await _load_frame(file, raw_text)
+    return _analyze_frame(frame, factor_column, metric_column)
+
+
+def _analyze_frame(
+    frame: Any,
+    factor_column: str | None,
+    metric_column: str | None,
+) -> tuple[list[dict[str, Any]], str]:
     factor_column = _infer_factor_column(frame, factor_column)
     metric_columns = (
         [str(metric_column)]
@@ -98,6 +124,135 @@ async def _analyze_request(
     ]
     _add_ranked_batch_charts(engines)
     return engines, factor_column
+
+
+def _column_key(column: Any) -> str:
+    return "".join(character for character in str(column).lower() if character.isalnum())
+
+
+def _profile(frame: Any) -> dict[str, Any]:
+    return {
+        "n_rows": int(len(frame)),
+        "columns": [str(column) for column in frame.columns],
+        "missing": {
+            str(column): int(frame[column].isna().sum())
+            for column in frame.columns
+        },
+    }
+
+
+def _is_identifier_column(column: Any) -> bool:
+    return _column_key(column) in IDENTIFIER_COLUMNS
+
+
+def _profile_mode(frame: Any, factor_column: str) -> dict[str, Any]:
+    if factor_column not in frame.columns:
+        raise DataParserError(f"Unknown profile column: {factor_column}")
+    if _is_identifier_column(factor_column):
+        return {
+            "mode": "refuse",
+            "reason": "identifier_column",
+            "profile": _profile(frame),
+            "offers": ["Choose a categorical business group such as Department or Treatment."],
+            "question": "Which column represents the business group or category?",
+        }
+    values = frame[factor_column].dropna().astype(str)
+    return {
+        "mode": "profile",
+        "reason": "value_counts",
+        "profile": _profile(frame),
+        "value_counts": values.value_counts().head(100).to_dict(),
+        "offers": ["Choose this column as a grouping factor for analysis."],
+    }
+
+
+def _design_gate(
+    frame: Any,
+    factor_column: str | None,
+    metric_column: str | None,
+    mode: str | None,
+) -> dict[str, Any] | None:
+    if mode == "profile":
+        if not factor_column:
+            raise DataParserError("profile mode requires factor_column")
+        return _profile_mode(frame, factor_column)
+
+    profile = _profile(frame)
+    if factor_column and _is_identifier_column(factor_column):
+        return {
+            "mode": "refuse",
+            "reason": "identifier_column",
+            "profile": profile,
+            "offers": ["Choose a real categorical group, such as Treatment, Department, or Segment."],
+            "question": "Which column represents the repeated business group?",
+        }
+
+    candidate_factor = factor_column
+    if not candidate_factor:
+        obvious = [
+            str(column) for column in frame.columns
+            if any(hint in _column_key(column) for hint in GROUP_COLUMN_HINTS)
+            and (is_object_dtype(frame[column]) or is_string_dtype(frame[column]))
+        ]
+        candidate_factor = obvious[0] if obvious else None
+    if not candidate_factor:
+        return {
+            "mode": "ask",
+            "reason": "no_obvious_group_column",
+            "profile": profile,
+            "offers": ["Select a grouping column", "Run profile mode for column counts"],
+            "question": "Which column should define the groups, departments, segments, or treatments?",
+        }
+    if candidate_factor not in frame.columns:
+        raise DataParserError(f"Unknown factor column: {candidate_factor}")
+    if not (is_object_dtype(frame[candidate_factor]) or is_string_dtype(frame[candidate_factor])):
+        return {
+            "mode": "refuse",
+            "reason": "factor_not_categorical",
+            "profile": profile,
+            "offers": ["Choose a categorical text column as the group."],
+            "question": "Which text column represents the groups?",
+        }
+
+    counts = frame[candidate_factor].dropna().value_counts()
+    if len(counts) < 2:
+        return {
+            "mode": "refuse",
+            "reason": "one_group_only",
+            "profile": profile,
+            "offers": ["Provide at least two repeated groups."],
+            "question": "Which column contains at least two business groups?",
+        }
+    if len(counts) >= len(frame) * 0.9 or counts.min() < 2:
+        return {
+            "mode": "refuse",
+            "reason": "unique_or_singleton_groups",
+            "profile": profile,
+            "offers": ["Choose a real grouping column, not a row number, ID, company name, or URL."],
+            "question": "Which column contains repeated groups suitable for comparison?",
+        }
+
+    numeric = [
+        str(column) for column in frame.columns
+        if is_numeric_dtype(frame[column]) and not _is_identifier_column(column)
+    ]
+    if metric_column and metric_column.upper() != "ALL" and _is_identifier_column(metric_column):
+        return {
+            "mode": "refuse",
+            "reason": "identifier_column_outcome",
+            "profile": profile,
+            "offers": ["Choose a numeric business measure, such as Revenue or Score."],
+            "question": "Which numeric column is the business outcome?",
+        }
+    if not numeric:
+        return {
+            "mode": "ask",
+            "reason": "no_numeric_outcome",
+            "profile": profile,
+            "offers": ["Choose a numeric business measure."],
+            "question": "Which numeric column should be analyzed?",
+        }
+    return None
 
 
 def _add_ranked_batch_charts(engines: list[dict[str, Any]]) -> None:
@@ -182,7 +337,9 @@ def _numeric_metric_columns(frame: Any, factor_column: str) -> list[str]:
     return [
         str(column)
         for column in frame.columns
-        if str(column) != factor_column and is_numeric_dtype(frame[column])
+        if str(column) != factor_column
+        and is_numeric_dtype(frame[column])
+        and not _is_identifier_column(column)
     ]
 
 
@@ -208,11 +365,16 @@ async def analyze(
     raw_text: str | None = Form(default=None),
     factor_column: str | None = Form(default=None),
     metric_column: str | None = Form(default=None),
+    mode: str | None = Form(default=None),
     response_format: str = Form(default="docx"),
     _: None = Depends(_verify_integration),
 ) -> StreamingResponse | JSONResponse:
     try:
-        engines, factor = await _analyze_request(file, raw_text, factor_column, metric_column)
+        frame = await _load_frame(file, raw_text)
+        gate_response = _design_gate(frame, factor_column, metric_column, mode)
+        if gate_response is not None:
+            return JSONResponse(content=gate_response)
+        engines, factor = _analyze_frame(frame, factor_column, metric_column)
         if response_format.lower() == "json":
             analyses = [_analysis_payload(engine) for engine in engines]
             payload: dict[str, Any] = {"analyses": analyses, "factor": factor}

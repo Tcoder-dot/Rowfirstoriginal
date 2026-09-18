@@ -111,10 +111,45 @@ R09,C,91.8,3
     by_metric = {analysis["metric"]: analysis for analysis in analyses}
     assert by_metric["Exam_Score"]["status"] == "success"
     assert by_metric["Exam_Score"]["chart_base64"].startswith("iVBORw0KGgo")
-    assert by_metric["ID_Number"]["status"] == "fallback"
-    assert by_metric["ID_Number"]["reason"] == "zero_variance"
-    assert by_metric["ID_Number"]["descriptive_stats"]["A"]["mean"] == 1.0
-    assert by_metric["ID_Number"]["chart_base64"] is None
+    assert "ID_Number" not in by_metric
+
+
+def test_api_gate_refuses_crm_row_id_and_index_design() -> None:
+    os.environ["ROWFIRST_ID"] = "demo-id"
+    os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"
+    text = "Company,Website,Revenue,Index,Row ID\n" + "\n".join(
+        f"Company {index},example{index}.com,{100 + index},{index},{index}"
+        for index in range(1, 101)
+    )
+    response = TestClient(app).post(
+        "/api/v1/analyze",
+        data={"raw_text": text, "metric_column": "ALL", "response_format": "json"},
+        headers={"X-Rowfirst-Id": "demo-id", "X-Rowfirst-Secret-Key": "demo-secret"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["mode"] in {"ask", "refuse"}
+    assert payload["profile"]["n_rows"] == 100
+    assert payload["reason"] in {"no_obvious_group_column", "unique_or_singleton_groups"}
+
+
+def test_api_profile_mode_returns_value_counts_without_testing() -> None:
+    os.environ["ROWFIRST_ID"] = "demo-id"
+    os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"
+    response = TestClient(app).post(
+        "/api/v1/analyze",
+        data={
+            "raw_text": "Department,Revenue\nEngineering,10\nEngineering,12\nSales,8\nSales,9\n",
+            "factor_column": "Department",
+            "mode": "profile",
+            "response_format": "json",
+        },
+        headers={"X-Rowfirst-Id": "demo-id", "X-Rowfirst-Secret-Key": "demo-secret"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["mode"] == "profile"
+    assert payload["value_counts"] == {"Engineering": 2, "Sales": 2}
 
 
 def test_api_batch_limits_charts_for_large_batches() -> None:
