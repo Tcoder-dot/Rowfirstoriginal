@@ -9,6 +9,23 @@ services:
         sync: false
       - key: ROWFIRST_SECRET_KEY
         sync: false
+      - key: ROWFIRST_CORS_ORIGINS
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ENABLE_POLLING
+        value: "false"
+
+  - type: worker
+    name: rowfirst-telegram
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerCommand: python bot.py
+    envVars:
+      - key: ROWFIRST_ID
+        sync: false
+      - key: ROWFIRST_SECRET_KEY
+        sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_ENABLE_POLLING

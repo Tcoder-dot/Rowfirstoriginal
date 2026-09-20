@@ -42,10 +42,24 @@ def analyze_dataframe(
         raise ValueError("factor_column and metric_column must be different")
 
     selected = frame[[factor_column, metric_column]].copy()
-    selected[metric_column] = pd.to_numeric(selected[metric_column], errors="coerce")
-    selected = selected.dropna(subset=[factor_column, metric_column])
+    raw_metric = selected[metric_column].copy()
+    numeric_metric = pd.to_numeric(raw_metric, errors="coerce")
+    blank_factor = selected[factor_column].isna() | selected[factor_column].astype(str).str.strip().eq("")
+    missing_metric = raw_metric.isna()
+    invalid_metric = raw_metric.notna() & numeric_metric.isna()
+    usable = ~(blank_factor | missing_metric | invalid_metric)
+    selected[metric_column] = numeric_metric
+    selected = selected.loc[usable].copy()
     if selected.empty:
         raise ValueError("The selected columns contain no usable observations")
+
+    exclusion_reasons = {}
+    if int(blank_factor.sum()):
+        exclusion_reasons["missing_factor"] = int(blank_factor.sum())
+    if int(missing_metric.sum()):
+        exclusion_reasons["missing_metric"] = int(missing_metric.sum())
+    if int(invalid_metric.sum()):
+        exclusion_reasons["non_numeric_metric"] = int(invalid_metric.sum())
 
     groups = [
         {"name": str(factor_value), "values": group[metric_column].astype(float).tolist()}
@@ -56,6 +70,12 @@ def analyze_dataframe(
         "factor": str(factor_column),
         "outcome": str(metric_column),
         "groups": groups,
+        "data_quality": {
+            "input_rows": int(len(frame)),
+            "analyzed_rows": int(len(selected)),
+            "excluded_rows": int(len(frame) - len(selected)),
+            "exclusion_reasons": exclusion_reasons,
+        },
     }
     from handle import analyze_ingested, build_breakdown
 
@@ -97,6 +117,10 @@ def analyze_dataframe(
             ),
         }
     engine["qa"] = quality_check(ingested)
+    if not engine["qa"]["ok"]:
+        details = "; ".join(engine["qa"].get("errors", []))
+        suggestions = " Suggestions: " + " ".join(engine["qa"].get("suggestions", []))
+        raise ValueError(details + suggestions)
     engine["breakdown"] = build_breakdown(engine)
     engine["factor"] = str(factor_column)
     engine["metric"] = str(metric_column)
@@ -158,7 +182,7 @@ def _financial_markdown(engine: dict[str, Any]) -> str:
         "## 2 Period-by-Period Financial Matrix (Table 1)",
         "",
         *_markdown_table(
-            ["Month/Period", "Mean Monthly Revenue", "Total Operating Expenses", "Active Client/Unit Counts", "Net Operating Cash Flow"],
+            ["Month/Period", "Mean Monthly Revenue", "Total Operating Expenses", "Active Client/Unit Counts", "EBITDA Cash-Flow Proxy"],
             _financial_rows(engine),
         ),
         "",
@@ -169,7 +193,7 @@ def _financial_markdown(engine: dict[str, Any]) -> str:
     lines.extend(f"- {warning.get('type', 'diagnostic')}: {warning.get('message') or warning.get('period') or warning.get('column') or 'review required'}" for warning in warnings)
     if not warnings:
         lines.append("- No anomalies detected against the configured diagnostics thresholds.")
-    lines.extend(["", "## 4 Strategic Recommendations & Visualization", "", "- Review burn-rate and expense-spike periods against unit economics and protect runway through targeted operating-cost controls.", "- Executive chart suite: revenue vs total expenses, EBITDA vs operating cash flow, and margins vs active clients/units."])
+    lines.extend(["", "## 4 Strategic Recommendations & Visualization", "", f"- Cash-flow disclosure: {engine.get('cash_flow_disclosure', 'Cash-flow basis was not specified.')}", "- Review burn-rate and expense-spike periods against unit economics and protect runway through targeted operating-cost controls.", "- Executive chart suite: revenue vs total expenses, EBITDA and cash-flow proxy, and margins vs active clients/units."])
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -189,11 +213,12 @@ def _write_financial_docx(engine: dict[str, Any], path: str | Path | BytesIO) ->
     document.add_paragraph(f"Profitability Metrics: Gross Margin {kpis.get('gross_profit_margin', 'n/a')}%; Net Profit Margin {kpis.get('net_profit_margin', 'n/a')}%; EBITDA {_financial_money(kpis.get('ebitda'))}; Operating Margin {kpis.get('operating_margin', 'n/a')}%.")
     document.add_paragraph(f"Capital Efficiency & Runway: {_financial_money(kpis.get('current_cash_reserves'))} reserves; {_financial_money(kpis.get('mean_monthly_cash_burn'))} mean monthly cash burn; {kpis.get('runway_months', 'undetermined')} months runway.")
     document.add_heading("2 Period-by-Period Financial Matrix (Table 1)", level=2)
-    _add_docx_table(document, ["Month/Period", "Mean Monthly Revenue", "Total Operating Expenses", "Active Client/Unit Counts", "Net Operating Cash Flow"], _financial_rows(engine))
+    _add_docx_table(document, ["Month/Period", "Mean Monthly Revenue", "Total Operating Expenses", "Active Client/Unit Counts", "EBITDA Cash-Flow Proxy"], _financial_rows(engine))
     document.add_heading("3 Automated Risk & Anomaly Diagnostics", level=2)
     for warning in engine.get("diagnostics", {}).get("warnings", []) or [{"message": "No anomalies detected against the configured diagnostics thresholds."}]:
         document.add_paragraph(str(warning.get("message") or warning.get("type") or warning.get("period")), style="List Bullet")
     document.add_heading("4 Strategic Recommendations & Visualization", level=2)
+    document.add_paragraph(str(engine.get("cash_flow_disclosure", "Cash-flow basis was not specified.")))
     document.add_paragraph("Review burn-rate and expense-spike periods against unit economics and protect runway through targeted operating-cost controls.")
     _embed_financial_chart(document, engine)
     document.save(destination)
@@ -204,7 +229,7 @@ def _embed_financial_chart(document: Any, engine: dict[str, Any]) -> None:
     from docx.shared import Inches
 
     charts = engine.get("charts_base64") or [engine.get("chart_base64")]
-    titles = ("Monthly Revenue vs Operating Expenses", "Monthly EBITDA and Operating Cash Flow", "Monthly Margins and Active Units")
+    titles = ("Monthly Revenue vs Operating Expenses", "Monthly EBITDA and Cash-Flow Proxy", "Monthly Margins and Active Units")
     for title, chart_base64 in zip(titles, charts):
         if chart_base64:
             document.add_paragraph(title)
@@ -229,9 +254,9 @@ def _write_financial_pdf(engine: dict[str, Any], path: str | Path) -> str:
         f"Profitability Metrics: Gross Margin {kpis.get('gross_profit_margin', 'n/a')}%; Net Profit Margin {kpis.get('net_profit_margin', 'n/a')}%; EBITDA {_financial_money(kpis.get('ebitda'))}; Operating Margin {kpis.get('operating_margin', 'n/a')}%.",
         f"Capital Efficiency & Runway: {_financial_money(kpis.get('current_cash_reserves'))} reserves; {_financial_money(kpis.get('mean_monthly_cash_burn'))} mean monthly cash burn; {kpis.get('runway_months', 'undetermined')} months runway.",
     ))
-    story.extend([Spacer(1, 0.12 * inch), Paragraph("2 Period-by-Period Financial Matrix (Table 1)", styles["Heading2"]), _pdf_table(["Month/Period", "Mean Monthly Revenue", "Total Operating Expenses", "Active Client/Unit Counts", "Net Operating Cash Flow"], _financial_rows(engine), styles), Paragraph("3 Automated Risk & Anomaly Diagnostics", styles["Heading2"])])
+    story.extend([Spacer(1, 0.12 * inch), Paragraph("2 Period-by-Period Financial Matrix (Table 1)", styles["Heading2"]), _pdf_table(["Month/Period", "Mean Monthly Revenue", "Total Operating Expenses", "Active Client/Unit Counts", "EBITDA Cash-Flow Proxy"], _financial_rows(engine), styles), Paragraph("3 Automated Risk & Anomaly Diagnostics", styles["Heading2"])])
     story.extend(Paragraph(str(warning.get("message") or warning.get("type") or warning.get("period")), styles["FinancialBody"]) for warning in engine.get("diagnostics", {}).get("warnings", []) or [{"message": "No anomalies detected against the configured diagnostics thresholds."}])
-    story.append(Paragraph("4 Strategic Recommendations & Visualization", styles["Heading2"]))
+    story.extend([Paragraph("4 Strategic Recommendations & Visualization", styles["Heading2"]), Paragraph(str(engine.get("cash_flow_disclosure", "Cash-flow basis was not specified.")), styles["FinancialBody"])])
     story.append(Paragraph("Review burn-rate and expense-spike periods against unit economics and protect runway through targeted operating-cost controls.", styles["FinancialBody"]))
     for chart_base64 in engine.get("charts_base64") or [engine.get("chart_base64")]:
         if chart_base64:
@@ -724,6 +749,12 @@ def _inferential_rows(results: list[dict[str, Any]]) -> list[tuple[str, str, str
             rows.append((name, "Simple linear regression", f"r = {result['r']:.12g}", "—", _fmt_p(result["p"]), _decision(result.get("isSignificant", False))))
         elif test in {"pearson", "spearman"}:
             rows.append((name, f"{test.title()} correlation", f"r = {result['r']:.12g}", str(result.get("n", "—")), _fmt_p(result["p"]), _decision(result.get("isSignificant", False))))
+        elif test == "multiple linear regression":
+            rows.append((name, "Multiple linear regression", f"R² = {result['rSquared']:.12g}", str(result.get("dfResidual", "—")), _fmt_p(result["p"]), _decision(result.get("isSignificant", False))))
+        elif test == "logistic regression":
+            rows.append((name, "Binary logistic regression", f"Pseudo-R² = {result['pseudoRSquared']:.12g}", str(result.get("dfModel", "—")), _fmt_p(result["likelihoodRatioP"]), _decision(result.get("isSignificant", False))))
+        elif test == "linear forecast":
+            rows.append((name, "Linear forecast", f"R² = {result['rSquared']:.12g}", str(result.get("horizon", "—")), _fmt_p(result["p"]), _decision(result.get("isSignificant", False))))
         elif test == "fisher-exact":
             rows.append((name, "Fisher exact test", "Exact test", "—", _fmt_p(result["p"]), _decision(result.get("isSignificant", False))))
         else:
@@ -805,6 +836,15 @@ def _working_notes(result: dict[str, Any]) -> list[str]:
         ]
     if test in {"pearson", "spearman"}:
         return [f"Formula: {test} correlation; n={result['n']}; r={result['r']:.12g}; exact p={_fmt_p(result['p'])}."]
+    if test == "multiple linear regression":
+        terms = "; ".join(f"{item['term']}: coefficient={item['coefficient']:.12g}, p={_fmt_p(item['p'])}" for item in result.get("coefficients", []))
+        return [f"Formula: ordinary least-squares multiple regression; n={result['n']}; predictors={', '.join(result['predictors'])}.", f"R²={result['rSquared']:.12g}, adjusted R²={result['adjustedRSquared']:.12g}, overall p={_fmt_p(result['p'])}.", terms]
+    if test == "logistic regression":
+        terms = "; ".join(f"{item['term']}: odds ratio={item['oddsRatio']:.12g}, p={_fmt_p(item['p'])}" for item in result.get("coefficients", []))
+        return [f"Formula: binary logistic regression; n={result['n']}; predictors={', '.join(result['predictors'])}.", f"Pseudo-R²={result['pseudoRSquared']:.12g}, likelihood-ratio p={_fmt_p(result['likelihoodRatioP'])}.", terms]
+    if test == "linear forecast":
+        forecasts = ", ".join(f"{value:.12g}" for value in result.get("forecast", []))
+        return [f"Formula: deterministic linear trend forecast; n={result['n']}; horizon={result['horizon']}.", f"slope={result['slope']:.12g}, R²={result['rSquared']:.12g}, exact p={_fmt_p(result['p'])}.", f"Forecast values: {forecasts}."]
     if test == "fisher-exact":
         return [f"Formula: Fisher exact test for a 2×2 count table; exact p={_fmt_p(result['p'])}."]
     return [f"Formula: chi-square test; χ²={result['chi2']:.12g}, df={result['df']}, exact p={_fmt_p(result['p'])}."]

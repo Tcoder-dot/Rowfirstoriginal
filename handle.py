@@ -5,6 +5,8 @@ import json
 import re
 from typing import Any
 
+import pandas as pd
+
 from ingest import ingest_text
 from qa import quality_check
 from analysis_service import (
@@ -17,12 +19,13 @@ from analysis_service import (
 )
 from data_parser import parse_tabular_text
 from financial_engine import analyze_financial_dataframe, is_financial_dataframe
+from stats_engine import linear_forecast, logistic_regression, multiple_linear_regression
 
 
 UNSUPPORTED = (
-    "I can analyse supported descriptive statistics, tests, correlations, and one-predictor "
-    "linear regression. Forecasting, multiple regression, GLM, logistic regression, mixed models, "
-    "and survival analysis are not supported."
+    "I can analyse supported descriptive statistics, tests, correlations, regression, logistic "
+    "regression, and deterministic linear forecasts. Mixed models, GLM families beyond binary "
+    "logistic regression, and survival analysis are not supported."
 )
 
 
@@ -38,13 +41,35 @@ def handle_analyze(req: dict) -> dict:
             financial_frame = None
         if financial_frame is not None and is_financial_dataframe(financial_frame):
             return analyze_financial_dataframe(financial_frame)
+        requested_mode = _requested_mode(text, request)
+        if requested_mode in {"multiple_regression", "logistic_regression", "forecast"}:
+            advanced_frame = parse_tabular_text(text)
+            predictor_value = request.get("predictor_columns") or request.get("predictors") or []
+            predictors = predictor_value.split(",") if isinstance(predictor_value, str) else list(predictor_value)
+            return analyze_advanced_dataframe(
+                advanced_frame,
+                requested_mode,
+                predictors=predictors,
+                outcome=request.get("outcome_column") or _requested_outcome(request),
+                time_column=request.get("time_column"),
+                horizon=int(request.get("horizon", 1)),
+            )
         ingested = ingest_text(text)
         engine = analyze_ingested(
             ingested,
-            mode=_requested_mode(text, request),
+            mode=requested_mode,
             outcome_name=_requested_outcome(request),
         )
         engine["qa"] = quality_check(ingested)
+        if not engine["qa"]["ok"]:
+            return {
+                "ok": False,
+                "refused": True,
+                "reason": "data_quality_error",
+                "ingested": ingested,
+                "qa": engine["qa"],
+                "suggestions": engine["qa"].get("suggestions", []),
+            }
         engine["breakdown"] = build_breakdown(engine)
         if request.get("study") or request.get("topic"):
             engine["topic"] = request.get("topic") or request.get("study")
@@ -120,6 +145,54 @@ def analyze_ingested(
     result = analyze_groups(ingested["groups"], outcome=outcome_name)
     if outcome_name and not result.get("parameter"):
         result["parameter"] = outcome_name
+    return _success(ingested, [result])
+
+
+def analyze_advanced_dataframe(
+    frame: Any,
+    mode: str,
+    predictors: list[str] | None = None,
+    outcome: str | None = None,
+    time_column: str | None = None,
+    horizon: int = 1,
+) -> dict[str, Any]:
+    """Run an explicitly selected advanced model without inferring its design."""
+    predictors = [str(column).strip() for column in (predictors or []) if str(column).strip()]
+    outcome = str(outcome or "").strip()
+    if mode == "multiple_regression":
+        if not outcome:
+            raise ValueError("Multiple regression requires outcome_column.")
+        result = multiple_linear_regression(frame, predictors, outcome)
+        result["model_specification"] = {"predictors": predictors, "outcome": outcome}
+    elif mode == "logistic_regression":
+        if not outcome:
+            raise ValueError("Logistic regression requires outcome_column.")
+        result = logistic_regression(frame, predictors, outcome)
+        result["model_specification"] = {"predictors": predictors, "outcome": outcome}
+    elif mode == "forecast":
+        if not outcome:
+            raise ValueError("Forecasting requires outcome_column.")
+        if outcome not in frame.columns:
+            raise ValueError(f"Unknown forecast outcome column: {outcome}")
+        ordered = frame
+        if time_column:
+            if time_column not in frame.columns:
+                raise ValueError(f"Unknown forecast time column: {time_column}")
+            ordered = frame.sort_values(time_column, kind="mergesort")
+        values = pd.to_numeric(ordered[outcome], errors="coerce").dropna().tolist()
+        result = linear_forecast(values, int(horizon))
+        result["outcome"] = outcome
+        result["time_column"] = time_column
+        result["model_specification"] = {"outcome": outcome, "time_column": time_column, "horizon": int(horizon)}
+    else:
+        raise ValueError("Unsupported advanced analysis mode")
+    ingested = {
+        "format": "advanced",
+        "mode": mode,
+        "predictors": predictors,
+        "outcome": outcome,
+        "time_column": time_column,
+    }
     return _success(ingested, [result])
 
 
@@ -203,6 +276,21 @@ def format_result(r: dict) -> str:
             f"slope={r['slope']:.4f}, intercept={r['intercept']:.4f}, r={r['r']:.4f}, r²={r['rSquared']:.4f}, "
             f"p={_p(r['p'])}, n={r['n']}"
         )
+    if test == "multiple linear regression":
+        coefficients = "; ".join(
+            f"{item['term']}={item['coefficient']:.4f} (p={_p(item['p'])})"
+            for item in r.get("coefficients", [])
+        )
+        return f"{title}Multiple linear regression\nR²={r['rSquared']:.4f}, adjusted R²={r['adjustedRSquared']:.4f}, F p={_p(r['p'])}, n={r['n']}\n{coefficients}"
+    if test == "logistic regression":
+        coefficients = "; ".join(
+            f"{item['term']} OR={item['oddsRatio']:.4f} (p={_p(item['p'])})"
+            for item in r.get("coefficients", [])
+        )
+        return f"{title}Binary logistic regression\nPseudo-R²={r['pseudoRSquared']:.4f}, likelihood-ratio p={_p(r['likelihoodRatioP'])}, n={r['n']}\n{coefficients}"
+    if test == "linear forecast":
+        values = ", ".join(f"{value:.4f}" for value in r.get("forecast", []))
+        return f"{title}Deterministic linear forecast\nHorizon={r['horizon']}, slope={r['slope']:.4f}, R²={r['rSquared']:.4f}\nForecast: {values}"
     if test in {"pearson", "spearman"}:
         return (
             f"{title}{test.title()} correlation\n"
@@ -865,7 +953,7 @@ def _df(df: float) -> str:
 
 
 def _requested_mode(text: str, request: dict) -> str | None:
-    if request.get("mode") in {"correlation", "regression"}:
+    if request.get("mode") in {"correlation", "regression", "multiple_regression", "logistic_regression", "forecast"}:
         return request["mode"]
     lower = text.lower()
     if "correlation" in lower or "pearson" in lower or "spearman" in lower:
@@ -896,7 +984,7 @@ def _requested_outcome(request: dict) -> str | None:
 
 def _is_unsupported(text: str) -> bool:
     lower = text.lower()
-    if any(term in lower for term in ("forecast", "forecasting", "mixed model", "survival analysis", "generalized linear", "glm", "logistic regression", "multiple regression")):
+    if any(term in lower for term in ("mixed model", "survival analysis", "generalized linear", "glm")):
         return True
     return bool(re.search(r"\b\d+\s+predictors?\b", lower))
 

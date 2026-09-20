@@ -226,6 +226,8 @@ def correlation(x: list[float], y: list[float], method: str = "pearson") -> dict
         raise ValueError("Correlation needs at least three paired observations.")
     if not np.isfinite(a).all() or not np.isfinite(b).all():
         raise ValueError("Correlation columns must contain finite numbers only.")
+    if np.ptp(a) == 0 or np.ptp(b) == 0:
+        raise ValueError("Correlation needs non-constant numeric columns.")
     if method not in {"pearson", "spearman"}:
         raise ValueError("Correlation method must be pearson or spearman.")
     result = stats.pearsonr(a, b) if method == "pearson" else stats.spearmanr(a, b)
@@ -249,6 +251,8 @@ def paired_ttest(
     if not np.isfinite(a).all() or not np.isfinite(b).all():
         raise ValueError("Paired columns must contain finite numbers only.")
     differences = b - a
+    if np.ptp(differences) == 0:
+        raise ValueError("Paired t-test needs variable paired differences.")
     result = stats.ttest_rel(a, b)
     sd_diff = float(np.std(differences, ddof=1))
     dz = float(np.mean(differences) / sd_diff) if sd_diff else 0.0
@@ -299,6 +303,8 @@ def two_way_anova(
     model = ols("_y ~ C(_a) * C(_b)", data=frame).fit()
     table = anova_lm(model, typ=2)
     residual_df = float(table.loc["Residual", "df"])
+    if not np.isfinite(residual_df) or residual_df <= 0:
+        raise ValueError("Two-way ANOVA needs a non-singular design with residual degrees of freedom.")
     effects = []
     labels = [
         (f"{factor_a}", "C(_a)"),
@@ -307,6 +313,8 @@ def two_way_anova(
     ]
     for label, row_name in labels:
         row = table.loc[row_name]
+        if not np.isfinite(float(row["F"])) or not np.isfinite(float(row["PR(>F)"])):
+            raise ValueError("Two-way ANOVA produced a non-finite effect; the design is singular.")
         effects.append(
             {
                 "effect": label,
@@ -337,6 +345,8 @@ def linear_regression(x: list[float], y: list[float], x_name: str = "X", y_name:
         raise ValueError("Simple linear regression needs at least three paired observations.")
     if not np.isfinite(a).all() or not np.isfinite(b).all():
         raise ValueError("Regression columns must contain finite numbers only.")
+    if np.ptp(a) == 0 or np.ptp(b) == 0:
+        raise ValueError("Regression needs non-constant predictor and outcome columns.")
     result = stats.linregress(a, b)
     return {
         "test": "simple linear regression",
@@ -351,6 +361,146 @@ def linear_regression(x: list[float], y: list[float], x_name: str = "X", y_name:
         "stderr": float(result.stderr),
         "isSignificant": bool(result.pvalue < 0.05),
         "pairs": list(zip(a.tolist(), b.tolist())),
+    }
+
+
+def multiple_linear_regression(
+    frame: Any,
+    predictors: list[str],
+    outcome: str,
+) -> dict[str, Any]:
+    """Deterministic ordinary least-squares regression for explicit columns."""
+    import pandas as pd
+    import statsmodels.api as sm
+
+    if len(predictors) < 2:
+        raise ValueError("Multiple regression needs at least two predictor columns.")
+    if outcome in predictors or len(set(predictors)) != len(predictors):
+        raise ValueError("Regression predictors and outcome must be distinct columns.")
+    columns = [*predictors, outcome]
+    if any(column not in frame.columns for column in columns):
+        raise ValueError("All regression columns must exist in the uploaded data.")
+    working = frame[columns].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(working) <= len(predictors) + 1:
+        raise ValueError("Multiple regression needs more observations than parameters.")
+    x_values = working[predictors].to_numpy(dtype=float)
+    y_values = working[outcome].to_numpy(dtype=float)
+    if not np.isfinite(x_values).all() or not np.isfinite(y_values).all():
+        raise ValueError("Regression columns must contain finite numbers only.")
+    design = sm.add_constant(x_values, has_constant="add")
+    if np.linalg.matrix_rank(design) < design.shape[1]:
+        raise ValueError("Multiple regression predictors are linearly dependent.")
+    fitted = sm.OLS(y_values, design).fit()
+    if not np.isfinite(fitted.params).all() or not np.isfinite(fitted.pvalues).all():
+        raise ValueError("Multiple regression produced non-finite coefficients.")
+    coefficients = []
+    names = ["intercept", *predictors]
+    for name, coefficient, standard_error, p_value in zip(names, fitted.params, fitted.bse, fitted.pvalues):
+        coefficients.append({
+            "term": name,
+            "coefficient": float(coefficient),
+            "standardError": float(standard_error),
+            "p": float(p_value),
+            "isSignificant": bool(p_value < 0.05),
+        })
+    return {
+        "test": "multiple linear regression",
+        "predictors": predictors,
+        "outcome": outcome,
+        "n": int(len(working)),
+        "dfModel": int(fitted.df_model),
+        "dfResidual": int(fitted.df_resid),
+        "rSquared": float(fitted.rsquared),
+        "adjustedRSquared": float(fitted.rsquared_adj),
+        "F": float(fitted.fvalue),
+        "p": float(fitted.f_pvalue),
+        "isSignificant": bool(fitted.f_pvalue < 0.05),
+        "coefficients": coefficients,
+    }
+
+
+def logistic_regression(
+    frame: Any,
+    predictors: list[str],
+    outcome: str,
+) -> dict[str, Any]:
+    """Deterministic binary logistic regression for an explicit 0/1 outcome."""
+    import pandas as pd
+    import statsmodels.api as sm
+
+    if len(predictors) < 1:
+        raise ValueError("Logistic regression needs at least one predictor column.")
+    if outcome in predictors or len(set(predictors)) != len(predictors):
+        raise ValueError("Logistic predictors and outcome must be distinct columns.")
+    columns = [*predictors, outcome]
+    if any(column not in frame.columns for column in columns):
+        raise ValueError("All logistic regression columns must exist in the uploaded data.")
+    working = frame[columns].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(working) <= len(predictors) + 2:
+        raise ValueError("Logistic regression needs more observations than parameters.")
+    y_values = working[outcome].to_numpy(dtype=float)
+    if set(np.unique(y_values)) != {0.0, 1.0}:
+        raise ValueError("Logistic regression outcome must contain exactly the values 0 and 1.")
+    x_values = working[predictors].to_numpy(dtype=float)
+    design = sm.add_constant(x_values, has_constant="add")
+    if np.linalg.matrix_rank(design) < design.shape[1]:
+        raise ValueError("Logistic regression predictors are linearly dependent.")
+    try:
+        fitted = sm.Logit(y_values, design).fit(disp=False, method="lbfgs")
+    except Exception as exc:
+        raise ValueError("Logistic regression could not fit a stable binary model.") from exc
+    if not np.isfinite(fitted.params).all() or not np.isfinite(fitted.pvalues).all():
+        raise ValueError("Logistic regression produced non-finite coefficients.")
+    coefficients = []
+    names = ["intercept", *predictors]
+    for name, coefficient, standard_error, p_value in zip(names, fitted.params, fitted.bse, fitted.pvalues):
+        coefficients.append({
+            "term": name,
+            "coefficient": float(coefficient),
+            "oddsRatio": float(np.exp(coefficient)),
+            "standardError": float(standard_error),
+            "p": float(p_value),
+            "isSignificant": bool(p_value < 0.05),
+        })
+    return {
+        "test": "logistic regression",
+        "predictors": predictors,
+        "outcome": outcome,
+        "n": int(len(working)),
+        "dfModel": int(fitted.df_model),
+        "pseudoRSquared": float(fitted.prsquared),
+        "logLikelihood": float(fitted.llf),
+        "likelihoodRatioP": float(fitted.llr_pvalue),
+        "isSignificant": bool(fitted.llr_pvalue < 0.05),
+        "coefficients": coefficients,
+    }
+
+
+def linear_forecast(values: list[float], horizon: int = 1) -> dict[str, Any]:
+    """Deterministic linear trend forecast for an explicitly ordered series."""
+    if len(values) < 3:
+        raise ValueError("Forecasting needs at least three ordered observations.")
+    if horizon < 1 or horizon > 24:
+        raise ValueError("Forecast horizon must be between 1 and 24 periods.")
+    observed = np.asarray(values, dtype=float)
+    if not np.isfinite(observed).all():
+        raise ValueError("Forecast values must contain finite numbers only.")
+    time = np.arange(len(observed), dtype=float)
+    fitted = stats.linregress(time, observed)
+    if not np.isfinite([fitted.slope, fitted.intercept, fitted.pvalue]).all():
+        raise ValueError("Forecast trend produced non-finite values.")
+    future_time = np.arange(len(observed), len(observed) + horizon, dtype=float)
+    return {
+        "test": "linear forecast",
+        "n": int(len(observed)),
+        "horizon": int(horizon),
+        "slope": float(fitted.slope),
+        "intercept": float(fitted.intercept),
+        "rSquared": float(fitted.rvalue ** 2),
+        "p": float(fitted.pvalue),
+        "fittedValues": (fitted.intercept + fitted.slope * time).tolist(),
+        "forecast": (fitted.intercept + fitted.slope * future_time).tolist(),
+        "isSignificant": bool(fitted.pvalue < 0.05),
     }
 
 

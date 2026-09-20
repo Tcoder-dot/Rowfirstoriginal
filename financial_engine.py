@@ -15,8 +15,9 @@ from scipy.stats import linregress
 
 
 DATE_ALIASES = {"date", "month", "period", "monthdate", "transactiondate"}
-REVENUE_ALIASES = {"revenue", "revenues", "revenueusd", "netrevenue", "netrevenueusd", "sales", "salesusd", "income", "turnover"}
+REVENUE_ALIASES = {"revenue", "revenues", "revenueusd", "netrevenue", "netrevenueusd", "netsales", "netsalesvalue", "netsalesusd", "sales", "salesusd", "income", "turnover"}
 CASH_ALIASES = {"cashreserves", "cashreservesusd", "cashreserve", "cashreserveusd", "cash", "cashusd", "cashbalance", "endingcash"}
+CASH_FLOW_ALIASES = {"operatingcashflow", "operatingcashflowusd", "netoperatingcashflow", "cashflowfromoperations", "cashflowfromoperationsusd"}
 COGS_ALIASES = {"cogs", "costofgoods sold", "costofgoodssold", "costofsales"}
 ACTIVE_ALIASES = {"activeclients", "activeclientcount", "activeunits", "activeunitcount", "customers", "units"}
 EXPENSE_ALIASES = {
@@ -93,6 +94,13 @@ def _expense_columns(frame: pd.DataFrame) -> list[str]:
     return [str(column) for column in frame.columns if _key(column) in EXPENSE_ALIASES]
 
 
+def _effective_expense_columns(columns: list[str]) -> list[str]:
+    fields = [_expense_field(column) for column in columns]
+    if "operating_expenses" in fields and len(set(fields)) > 1:
+        return [column for column in columns if _expense_field(column) == "operating_expenses"]
+    return columns
+
+
 def _expense_field(column: str) -> str:
     return EXPENSE_ALIASES[_key(column)]
 
@@ -108,7 +116,39 @@ def is_financial_dataframe(frame: pd.DataFrame) -> bool:
     )
 
 
-def _monthly_frame(frame: pd.DataFrame, date_column: str, revenue_column: str, cash_column: str | None, cogs_column: str | None, active_column: str | None, expense_columns: list[str]) -> pd.DataFrame:
+def financial_schema_profile(frame: pd.DataFrame) -> dict[str, Any]:
+    """Describe financial columns without inventing missing accounting fields."""
+    date_column = _find_column(frame, DATE_ALIASES)
+    revenue_column = _find_column(frame, REVENUE_ALIASES)
+    expense_columns = _expense_columns(frame)
+    cash_column = _find_column(frame, CASH_ALIASES)
+    revenue_key = _key(revenue_column) if revenue_column else ""
+    strong_revenue_signal = revenue_key in {"netsales", "netsalesvalue", "netsalesusd", "netrevenue", "netrevenueusd"}
+    signals = bool(expense_columns or cash_column or (date_column and revenue_column) or strong_revenue_signal)
+    missing = []
+    if not date_column:
+        missing.append("date_or_month")
+    if not revenue_column:
+        missing.append("revenue_or_sales")
+    if not expense_columns:
+        missing.append("operating_expenses_or_costs")
+    return {
+        "financial_signals_detected": signals,
+        "complete": not missing,
+        "date_column": date_column,
+        "revenue_column": revenue_column,
+        "expense_columns": expense_columns,
+        "cash_column": cash_column,
+        "missing_required_fields": missing,
+    }
+
+
+def looks_like_financial_dataframe(frame: pd.DataFrame) -> bool:
+    """Return true when the table has financial signals but may need mapping."""
+    return financial_schema_profile(frame)["financial_signals_detected"]
+
+
+def _monthly_frame(frame: pd.DataFrame, date_column: str, revenue_column: str, cash_column: str | None, cash_flow_column: str | None, cogs_column: str | None, active_column: str | None, expense_columns: list[str]) -> pd.DataFrame:
     working = pd.DataFrame(index=frame.index)
     working["period"] = pd.to_datetime(frame[date_column], format="mixed", errors="coerce").dt.to_period("M").astype("string")
     working["revenue"] = _number_series(frame, revenue_column)
@@ -117,6 +157,8 @@ def _monthly_frame(frame: pd.DataFrame, date_column: str, revenue_column: str, c
         working[field] = _number_series(frame, column)
     if cash_column:
         working["cash_reserves"] = _number_series(frame, cash_column)
+    if cash_flow_column:
+        working["reported_operating_cash_flow"] = _number_series(frame, cash_flow_column)
     if cogs_column:
         working["cogs"] = _number_series(frame, cogs_column)
     if active_column:
@@ -189,7 +231,7 @@ def _chart_suite_base64(monthly: pd.DataFrame) -> list[str]:
     axis.bar(x_values + 0.18, monthly["net_operating_cash_flow"], width=0.36, color="#fb7185", label="Net operating cash flow")
     axis.set_xticks(x_values, periods, rotation=45, ha="right")
     axis.set_ylabel("Cash flow", color="#f8fafc")
-    axis.set_title("Monthly EBITDA and Operating Cash Flow", color="#f8fafc")
+    axis.set_title("Monthly EBITDA and Cash-Flow Proxy", color="#f8fafc")
     axis.tick_params(colors="#f8fafc")
     axis.grid(axis="y", color="#6b5a83", alpha=0.25)
     axis.legend(facecolor="#241631", labelcolor="#f8fafc")
@@ -225,22 +267,49 @@ def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
     date_column = _find_column(frame, DATE_ALIASES)
     revenue_column = _find_column(frame, REVENUE_ALIASES)
     cash_column = _find_column(frame, CASH_ALIASES)
+    cash_flow_column = _find_column(frame, CASH_FLOW_ALIASES)
     cogs_column = _find_column(frame, COGS_ALIASES)
     active_column = _find_column(frame, ACTIVE_ALIASES)
-    expense_columns = _expense_columns(frame)
+    detected_expense_columns = _expense_columns(frame)
+    expense_columns = _effective_expense_columns(detected_expense_columns)
     if not date_column or not revenue_column:
         raise ValueError("Financial ledger requires a Date or Month column and a Revenue column")
     if not expense_columns:
         raise ValueError("Financial ledger requires Operating Expenses, Payroll, or Marketing Spend")
 
+    numeric_columns = [revenue_column, *detected_expense_columns, cash_column, cash_flow_column, cogs_column, active_column]
+    invalid_numeric_warnings = []
+    for column in [column for column in numeric_columns if column]:
+        converted = pd.to_numeric(frame[column], errors="coerce")
+        invalid = frame[column].notna() & converted.isna()
+        if int(invalid.sum()):
+            invalid_numeric_warnings.append({
+                "type": "invalid_numeric_values",
+                "column": column,
+                "count": int(invalid.sum()),
+                "severity": "critical",
+            })
+    if invalid_numeric_warnings:
+        details = ", ".join(f"{item['column']} ({item['count']} invalid)" for item in invalid_numeric_warnings)
+        raise ValueError(f"Financial data contains non-numeric values: {details}")
+
     warnings = _diagnostics(frame, date_column, revenue_column, expense_columns)
-    monthly = _monthly_frame(frame, date_column, revenue_column, cash_column, cogs_column, active_column, expense_columns)
+    warnings.extend(invalid_numeric_warnings)
+    if expense_columns != detected_expense_columns:
+        warnings.append({
+            "type": "overlapping_expense_columns",
+            "message": "Operating Expenses was used as the aggregate expense column; component columns were not added again.",
+            "columns": detected_expense_columns,
+            "severity": "warning",
+        })
+    monthly = _monthly_frame(frame, date_column, revenue_column, cash_column, cash_flow_column, cogs_column, active_column, expense_columns)
     if monthly.empty:
         raise ValueError("No valid financial periods were found")
     expense_fields = [_expense_field(column) for column in expense_columns]
     monthly["total_expenses"] = monthly[expense_fields].sum(axis=1, min_count=1)
     monthly["ebitda"] = monthly["revenue"] - monthly["total_expenses"]
-    monthly["net_operating_cash_flow"] = monthly["ebitda"]
+    cash_flow_status = "reported" if cash_flow_column else "ebitda_proxy"
+    monthly["net_operating_cash_flow"] = monthly.get("reported_operating_cash_flow", monthly["ebitda"])
     monthly["gross_profit"] = monthly["revenue"] - monthly.get("cogs", monthly["total_expenses"])
     monthly["operating_margin"] = np.where(monthly["revenue"] != 0, monthly["ebitda"] / monthly["revenue"] * 100, np.nan)
     monthly["gross_margin"] = np.where(monthly["revenue"] != 0, monthly["gross_profit"] / monthly["revenue"] * 100, np.nan)
@@ -324,6 +393,12 @@ def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
             "avg_mom_growth": avg_mom_growth,
         },
         "diagnostics": {"warnings": warnings, "warning_count": len(warnings)},
+        "cash_flow_status": cash_flow_status,
+        "cash_flow_disclosure": (
+            "Net operating cash flow was supplied in the input ledger."
+            if cash_flow_status == "reported"
+            else "Net operating cash flow is an EBITDA-based proxy because working-capital, tax, capital-expenditure, and financing movements were not supplied."
+        ),
         "executive_summary": narrative,
         "executive_text_blocks": [narrative],
         "chart_base64": _chart_base64(monthly),

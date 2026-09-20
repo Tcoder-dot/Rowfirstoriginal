@@ -1,6 +1,8 @@
 """Thin Telegram client for the deterministic Rowfirst analysis service."""
 from __future__ import annotations
 
+import base64
+from io import BytesIO
 import os
 import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -63,6 +65,46 @@ def _choose_columns(frame: Any) -> tuple[str, str]:
     return str(factor), str(metric)
 
 
+def _send_text_chunks(bot: Any, chat_id: int, text: str) -> None:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return
+    for start in range(0, len(cleaned), 4000):
+        bot.send_message(chat_id, cleaned[start:start + 4000])
+
+
+def _send_engine_outputs(bot: Any, message: Any, engine: dict[str, Any]) -> None:
+    chat_id = message.chat.id
+    if engine.get("analysis_type") == "executive_financial":
+        _send_text_chunks(bot, chat_id, engine.get("executive_summary", ""))
+        warnings = engine.get("diagnostics", {}).get("warnings", [])
+        if warnings:
+            lines = ["Diagnostics:"]
+            lines.extend(
+                f"- {warning.get('message') or warning.get('type') or warning.get('period', 'Review required')}"
+                for warning in warnings
+            )
+            _send_text_chunks(bot, chat_id, "\n".join(lines))
+    else:
+        breakdown = engine.get("breakdown", "")
+        result_text = engine.get("message", "")
+        _send_text_chunks(bot, chat_id, breakdown)
+        if result_text and result_text != breakdown:
+            _send_text_chunks(bot, chat_id, f"Verified results:\n{result_text}")
+
+    charts = engine.get("charts_base64") or [engine.get("chart_base64")]
+    chart_titles = (
+        "Monthly revenue and operating expenses",
+        "Monthly EBITDA and operating cash flow",
+        "Monthly margins and active units",
+    )
+    for index, chart_base64 in enumerate(charts):
+        if not chart_base64:
+            continue
+        caption = chart_titles[index] if index < len(chart_titles) else "Analysis chart"
+        bot.send_photo(chat_id, BytesIO(base64.b64decode(chart_base64)), caption=caption)
+
+
 def _analyze_and_send(bot: Any, message: Any, frame: Any) -> None:
     if is_financial_dataframe(frame):
         engine = analyze_financial_dataframe(frame)
@@ -77,6 +119,7 @@ def _analyze_and_send(bot: Any, message: Any, frame: Any) -> None:
         generate_docx(engine, path)
         with path.open("rb") as report:
             bot.send_document(message.chat.id, report, caption=filename)
+    _send_engine_outputs(bot, message, engine)
 
 
 def _send_invoice(bot: Any, message: Any) -> None:

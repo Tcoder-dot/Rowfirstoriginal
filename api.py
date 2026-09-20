@@ -3,9 +3,12 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from io import BytesIO
+import asyncio
 import logging
 import os
 import secrets
+import time
+from uuid import uuid4
 from threading import Lock, Thread
 from typing import Any
 
@@ -13,17 +16,30 @@ from pandas.api.types import is_numeric_dtype, is_object_dtype, is_string_dtype
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from analysis_service import analyze_dataframe, generate_docx
 from charts import make_chart_base64
 from data_parser import DataParserError, parse_tabular_text, parse_uploaded_file
-from financial_engine import analyze_financial_dataframe, is_financial_dataframe
+from financial_engine import (
+    analyze_financial_dataframe,
+    financial_schema_profile,
+    is_financial_dataframe,
+    looks_like_financial_dataframe,
+)
+from handle import analyze_advanced_dataframe
 
 
 IDENTIFIER_COLUMNS = {
     "id", "rowid", "recordid", "uuid", "index", "sampleid", "idnumber",
     "identifier", "rownumber", "recordnumber", "recordcode",
 }
+MAX_REQUEST_BYTES = int(os.getenv("ROWFIRST_MAX_REQUEST_BYTES", str(50 * 1024 * 1024)))
+MAX_UPLOAD_BYTES = int(os.getenv("ROWFIRST_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+MAX_ROWS = int(os.getenv("ROWFIRST_MAX_ROWS", "100000"))
+MAX_COLUMNS = int(os.getenv("ROWFIRST_MAX_COLUMNS", "2000"))
+MAX_CONCURRENT_ANALYSES = int(os.getenv("ROWFIRST_MAX_CONCURRENT_ANALYSES", "2"))
+_analysis_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ANALYSES)
 GROUP_COLUMN_HINTS = {
     "treatment", "group", "groups", "arm", "method", "methods", "condition",
     "department", "category", "type", "variant", "segment", "region", "cohort",
@@ -43,25 +59,58 @@ _telegram_started = False
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    # The browser rejects wildcard origins when credentialed cookies are enabled.
-    # This API authenticates with headers/form values, not browser cookies.
+    allow_origins=[origin.strip() for origin in os.getenv("ROWFIRST_CORS_ORIGINS", "").split(",") if origin.strip()],
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "X-Rowfirst-Id", "X-Rowfirst-Secret-Key"],
+    expose_headers=["Content-Disposition"],
 )
+
+
+@app.middleware("http")
+async def request_limits_and_logging(request: Request, call_next: Any) -> Any:
+    request_id = request.headers.get("X-Request-Id") or uuid4().hex
+    request.state.request_id = request_id
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > MAX_REQUEST_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"error": "request_too_large", "message": "Request exceeds the configured size limit.", "request_id": request_id},
+        )
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("Unhandled request failure request_id=%s method=%s path=%s", request_id, request.method, request.url.path)
+        raise
+    response.headers["X-Request-Id"] = request_id
+    logger.info("request_id=%s method=%s path=%s status=%s duration_ms=%.1f", request_id, request.method, request.url.path, response.status_code, (time.perf_counter() - started) * 1000)
+    return response
 
 
 @app.get("/", include_in_schema=False)
 @app.get("/health", include_in_schema=False)
+@app.get("/api/healthz", include_in_schema=False)
 async def health() -> dict[str, str]:
     return {"status": "ok", "service": "rowfirst-fastapi"}
 
 
+@app.get("/readyz", include_in_schema=False)
+async def readiness() -> JSONResponse:
+    checks = {"python": True, "analysis_imports": True}
+    try:
+        import pytesseract
+
+        checks["ocr_binary"] = bool(pytesseract.get_tesseract_version())
+    except Exception:
+        checks["ocr_binary"] = False
+    ready = checks["python"] and checks["analysis_imports"]
+    return JSONResponse(status_code=200 if ready else 503, content={"status": "ready" if ready else "degraded", "checks": checks})
+
+
 @app.exception_handler(Exception)
 async def internal_engine_error(_, __: Exception) -> JSONResponse:
-    return JSONResponse(status_code=500, content={"detail": "Internal Engine Error"})
+    return JSONResponse(status_code=500, content={"error": "internal_engine_error", "message": "The analysis could not be completed."})
 
 
 def _start_telegram_polling() -> None:
@@ -112,6 +161,10 @@ async def _verify_integration(request: Request) -> None:
         if scheme.lower() == "bearer":
             secret_key = token.strip() or None
 
+    if request.query_params.get("rowfirst_id") or request.query_params.get("rowfirst_secret_key"):
+        if os.getenv("ROWFIRST_ALLOW_QUERY_AUTH", "false").lower() not in {"1", "true", "yes"}:
+            raise HTTPException(status_code=400, detail="Credentials must be supplied in headers or Authorization.")
+
     expected_id = os.getenv("ROWFIRST_ID")
     expected_secret = os.getenv("ROWFIRST_SECRET_KEY")
     if not expected_id or not expected_secret:
@@ -130,11 +183,20 @@ async def _load_frame(
     raw_text: str | None,
 ) -> Any:
     if file is not None:
-        frame = parse_uploaded_file(await file.read(), file.filename or "")
+        payload = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(payload) > MAX_UPLOAD_BYTES:
+            raise DataParserError("Uploaded file exceeds the configured size limit")
+        frame = parse_uploaded_file(payload, file.filename or "")
     elif raw_text:
+        if len(raw_text.encode("utf-8")) > MAX_UPLOAD_BYTES:
+            raise DataParserError("Pasted data exceeds the configured size limit")
         frame = parse_tabular_text(raw_text)
     else:
         raise DataParserError("Provide a CSV file or raw_text")
+    if len(frame) > MAX_ROWS:
+        raise DataParserError(f"Input contains {len(frame)} rows; maximum is {MAX_ROWS}")
+    if len(frame.columns) > MAX_COLUMNS:
+        raise DataParserError(f"Input contains {len(frame.columns)} columns; maximum is {MAX_COLUMNS}")
     return frame
 
 
@@ -221,6 +283,20 @@ def _design_gate(
         return _profile_mode(frame, factor_column)
 
     profile = _profile(frame)
+    financial_profile = financial_schema_profile(frame)
+    if looks_like_financial_dataframe(frame) and not financial_profile["complete"]:
+        return {
+            "mode": "ask",
+            "reason": "incomplete_financial_schema",
+            "profile": profile,
+            "financial_schema": financial_profile,
+            "offers": [
+                "Provide or map a date/month column",
+                "Provide or map a revenue/sales column",
+                "Provide or map an operating expense/cost column",
+            ],
+            "question": "This looks like financial data, but the ledger schema is incomplete. Which columns represent period, revenue, and operating expenses?",
+        }
     if factor_column and _is_identifier_column(factor_column):
         return {
             "mode": "refuse",
@@ -392,6 +468,7 @@ def _analysis_payload(engine: dict[str, Any]) -> dict[str, Any]:
         "metric": engine.get("metric"),
         "status": engine.get("status", "success"),
         "result_text": engine.get("message", ""),
+        "breakdown": engine.get("breakdown", ""),
         "result": result,
         "chart_base64": engine.get("chart_base64"),
         **({"reason": engine["reason"], "descriptive_stats": engine["descriptive_stats"]} if engine.get("status") == "fallback" else {}),
@@ -404,23 +481,34 @@ def _public_engine(engine: dict[str, Any]) -> dict[str, Any]:
 
 @app.post("/api/v1/analyze", response_model=None)
 async def analyze(
+    request: Request,
     file: UploadFile | None = File(default=None),
     raw_text: str | None = Form(default=None),
     factor_column: str | None = Form(default=None),
     metric_column: str | None = Form(default=None),
     mode: str | None = Form(default=None),
-    response_format: str = Form(default="docx"),
+    predictor_columns: str | None = Form(default=None),
+    outcome_column: str | None = Form(default=None),
+    time_column: str | None = Form(default=None),
+    horizon: int = Form(default=1),
+    response_format: str | None = Form(default=None),
     _: None = Depends(_verify_integration),
 ) -> StreamingResponse | JSONResponse:
     try:
+        requested_format = response_format or (
+            "json"
+            if "application/json" in request.headers.get("accept", "").lower()
+            else "docx"
+        )
         frame = await _load_frame(file, raw_text)
         if is_financial_dataframe(frame):
-            financial = analyze_financial_dataframe(frame)
-            if response_format.lower() == "json":
+            async with _analysis_semaphore:
+                financial = await run_in_threadpool(analyze_financial_dataframe, frame)
+            if requested_format.lower() == "json":
                 return JSONResponse(content=financial)
-            if response_format.lower() != "docx":
+            if requested_format.lower() != "docx":
                 raise DataParserError("response_format must be 'docx' or 'json'")
-            buffer = generate_docx(financial)
+            buffer = await run_in_threadpool(generate_docx, financial)
             if not isinstance(buffer, BytesIO):
                 raise RuntimeError("DOCX generator returned an invalid buffer")
             buffer.seek(0)
@@ -430,23 +518,54 @@ async def analyze(
                 media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 headers=headers,
             )
+        if mode in {"multiple_regression", "logistic_regression", "forecast"}:
+            predictors = [
+                column.strip()
+                for column in (predictor_columns or "").split(",")
+                if column.strip()
+            ]
+            async with _analysis_semaphore:
+                advanced = await run_in_threadpool(
+                    analyze_advanced_dataframe,
+                    frame,
+                    mode,
+                    predictors,
+                    outcome_column,
+                    time_column,
+                    horizon,
+                )
+            if requested_format.lower() == "json":
+                return JSONResponse(content=_public_engine(advanced))
+            if requested_format.lower() != "docx":
+                raise DataParserError("response_format must be 'docx' or 'json'")
+            buffer = await run_in_threadpool(generate_docx, advanced)
+            if not isinstance(buffer, BytesIO):
+                raise RuntimeError("DOCX generator returned an invalid buffer")
+            buffer.seek(0)
+            headers = {"Content-Disposition": 'attachment; filename="Rowfirst_Advanced_Results.docx"'}
+            return StreamingResponse(
+                buffer,
+                media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                headers=headers,
+            )
         gate_response = _design_gate(frame, factor_column, metric_column, mode)
         if gate_response is not None:
             return JSONResponse(content=gate_response)
-        engines, factor = _analyze_frame(frame, factor_column, metric_column)
-        if response_format.lower() == "json":
+        async with _analysis_semaphore:
+            engines, factor = await run_in_threadpool(_analyze_frame, frame, factor_column, metric_column)
+        if requested_format.lower() == "json":
             analyses = [_analysis_payload(engine) for engine in engines]
             payload: dict[str, Any] = {"analyses": analyses, "factor": factor}
             if len(analyses) == 1:
                 payload.update(_public_engine(engines[0]))
             return JSONResponse(content=payload)
-        if response_format.lower() != "docx":
+        if requested_format.lower() != "docx":
             raise DataParserError("response_format must be 'docx' or 'json'")
         engine = dict(engines[0])
         engine["results"] = [item["result"] for item in engines]
         engine["result"] = engine["results"][0]
         engine["factor"] = factor
-        buffer = generate_docx(engine)
+        buffer = await run_in_threadpool(generate_docx, engine)
         if not isinstance(buffer, BytesIO):
             raise RuntimeError("DOCX generator returned an invalid buffer")
         buffer.seek(0)
@@ -487,6 +606,8 @@ async def financial_analysis(
             import pandas as pd
 
             frame = pd.DataFrame(payload)
-        return JSONResponse(content=analyze_financial_dataframe(frame))
+        async with _analysis_semaphore:
+            result = await run_in_threadpool(analyze_financial_dataframe, frame)
+        return JSONResponse(content=result)
     except (DataParserError, ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

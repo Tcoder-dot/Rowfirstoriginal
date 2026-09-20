@@ -9,6 +9,7 @@ import zipfile
 from pathlib import Path
 
 import pandas as pd
+import pytest
 from fastapi.testclient import TestClient
 
 from analysis_service import analyze_dataframe, generate_docx
@@ -25,6 +26,80 @@ from data_parser import (
 )
 from financial_engine import analyze_financial_dataframe
 from handle import build_breakdown
+
+
+def test_research_rejects_nonfinite_designs_and_reports_exclusions() -> None:
+    from stats_engine import correlation, linear_regression, paired_ttest
+
+    with pytest.raises(ValueError, match="non-constant"):
+        correlation([1, 1, 1], [1, 2, 3])
+    with pytest.raises(ValueError, match="non-constant"):
+        linear_regression([1, 1, 1], [1, 2, 3])
+    with pytest.raises(ValueError, match="variable paired differences"):
+        paired_ttest([1, 2, 3], [2, 3, 4])
+
+    engine = analyze_dataframe(
+        pd.DataFrame({"Treatment": ["A", "A", "B", "B"], "Value": [1, "bad", 4, 5]}),
+        "Treatment",
+        "Value",
+    )
+    quality = engine["ingested"]["data_quality"]
+    assert quality["input_rows"] == 4
+    assert quality["analyzed_rows"] == 3
+    assert quality["exclusion_reasons"] == {"non_numeric_metric": 1}
+
+
+def test_quality_errors_return_suggestions_without_a_result() -> None:
+    from handle import handle_analyze
+
+    bad_ingested = {
+        "format": "long",
+        "factor": "Treatment",
+        "outcome": "Moisture",
+        "groups": [
+            {"name": "A", "values": [101, 102]},
+            {"name": "B", "values": [20, 21]},
+        ],
+    }
+    import handle as handle_module
+
+    original_ingest = handle_module.ingest_text
+    handle_module.ingest_text = lambda _: bad_ingested
+    try:
+        result = handle_analyze({"text": "placeholder"})
+    finally:
+        handle_module.ingest_text = original_ingest
+    assert result["refused"] is True
+    assert result["reason"] == "data_quality_error"
+    assert result["suggestions"]
+    assert "between 0 and 100" in result["qa"]["errors"][0]
+
+
+def test_financial_analysis_rejects_invalid_numbers_and_discloses_proxies() -> None:
+    with pytest.raises(ValueError, match="non-numeric values"):
+        analyze_financial_dataframe(pd.DataFrame({
+            "Month": ["2026-01", "2026-02"],
+            "Revenue": [100, "bad"],
+            "Operating Expenses": [40, 45],
+        }))
+
+    result = analyze_financial_dataframe(pd.DataFrame({
+        "Month": ["2026-01", "2026-02"],
+        "Revenue": [100, 110],
+        "Operating Expenses": [40, 45],
+        "Payroll": [10, 10],
+    }))
+    assert result["cash_flow_status"] == "ebitda_proxy"
+    assert any(warning["type"] == "overlapping_expense_columns" for warning in result["diagnostics"]["warnings"])
+
+    reported = analyze_financial_dataframe(pd.DataFrame({
+        "Month": ["2026-01", "2026-02"],
+        "Revenue": [100, 110],
+        "Operating Expenses": [40, 45],
+        "Operating Cash Flow": [55, 60],
+    }))
+    assert reported["cash_flow_status"] == "reported"
+    assert reported["periods"][-1]["net_operating_cash_flow"] == 60.0
 
 
 def test_parser_delimiters() -> None:
@@ -84,6 +159,13 @@ def test_financial_api_accepts_json_rows() -> None:
     )
     assert response.status_code == 200
     assert response.json()["analysis_type"] == "executive_financial"
+
+
+def test_production_health_routes_are_available() -> None:
+    client = TestClient(app)
+    assert client.get("/health").status_code == 200
+    assert client.get("/api/healthz").status_code == 200
+    assert client.get("/readyz").status_code in {200, 503}
 
 
 def test_financial_api_accepts_word_upload() -> None:
@@ -221,6 +303,18 @@ def test_api_gate_refuses_crm_row_id_and_index_design() -> None:
     assert payload["mode"] in {"ask", "refuse"}
     assert payload["profile"]["n_rows"] == 100
     assert payload["reason"] in {"no_obvious_group_column", "unique_or_singleton_groups"}
+
+
+def test_wide_company_like_table_requests_financial_schema_mapping() -> None:
+    frame = pd.read_csv("stress_test_200col_1000rows.csv")
+    from api import _design_gate
+
+    response = _design_gate(frame, None, None, None)
+    assert response is not None
+    assert response["mode"] == "ask"
+    assert response["reason"] == "incomplete_financial_schema"
+    assert "date_or_month" in response["financial_schema"]["missing_required_fields"]
+    assert "operating_expenses_or_costs" in response["financial_schema"]["missing_required_fields"]
 
 
 def test_api_profile_mode_returns_value_counts_without_testing() -> None:
@@ -366,6 +460,18 @@ def test_public_api_uses_shared_engine_and_docx_output() -> None:
     assert payload["ok"] is True
     assert payload["factor"] == "Treatment"
     assert payload["metric"] == "Value"
+    accept_json_response = client.post(
+        "/api/v1/analyze",
+        data={
+            "raw_text": "Treatment\tValue\nA\t1\nA\t2\nB\t4\nB\t5\n",
+            "factor_column": "Treatment",
+            "metric_column": "Value",
+        },
+        headers={**headers, "Accept": "application/json"},
+    )
+    assert accept_json_response.status_code == 200
+    assert accept_json_response.headers["content-type"].startswith("application/json")
+    assert accept_json_response.json()["breakdown"]
 
     docx_response = client.post(
         "/api/v1/analyze",
@@ -380,6 +486,41 @@ def test_public_api_uses_shared_engine_and_docx_output() -> None:
     assert docx_response.status_code == 200
     assert docx_response.headers["content-type"].startswith("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     assert len(docx_response.content) > 1000
+
+
+def test_telegram_sends_verified_text_and_charts() -> None:
+    from bot import _send_engine_outputs
+
+    class Chat:
+        id = 42
+
+    class Message:
+        chat = Chat()
+
+    class RecordingBot:
+        def __init__(self) -> None:
+            self.messages = []
+            self.photos = []
+
+        def send_message(self, chat_id, text) -> None:
+            self.messages.append((chat_id, text))
+
+        def send_photo(self, chat_id, photo, caption) -> None:
+            self.photos.append((chat_id, photo.read(), caption))
+
+    bot = RecordingBot()
+    chart = base64.b64encode(b"chart").decode("ascii")
+    _send_engine_outputs(
+        bot,
+        Message(),
+        {"breakdown": "Plain-English breakdown", "message": "Verified result", "chart_base64": chart},
+    )
+
+    assert [text for _, text in bot.messages] == [
+        "Plain-English breakdown",
+        "Verified results:\nVerified result",
+    ]
+    assert bot.photos == [(42, b"chart", "Monthly revenue and operating expenses")]
 
 
 def test_public_api_accepts_form_query_and_bearer_credentials() -> None:
@@ -399,10 +540,12 @@ def test_public_api_accepts_form_query_and_bearer_credentials() -> None:
     )
     assert form_response.status_code == 200
 
+    os.environ["ROWFIRST_ALLOW_QUERY_AUTH"] = "true"
     query_response = client.post(
         "/api/v1/analyze?rowfirst_id=demo-id&rowfirst_secret_key=demo-secret",
         data=request_data,
     )
+    os.environ.pop("ROWFIRST_ALLOW_QUERY_AUTH", None)
     assert query_response.status_code == 200
 
     bearer_response = client.post(
@@ -434,3 +577,55 @@ def test_public_api_infers_columns_when_not_supplied() -> None:
     assert response.status_code == 200
     assert response.json()["factor"] == "Treatment"
     assert response.json()["metric"] == "Value"
+
+
+def test_public_api_supports_explicit_advanced_models_and_docx() -> None:
+    os.environ["ROWFIRST_ID"] = "demo-id"
+    os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"
+    frame = pd.DataFrame({
+        "X1": [0, 0, 1, 1, 2, 0, 2, 1, 3, 0],
+        "X2": [0, 1, 0, 1, 0, 2, 1, 2, 0, 3],
+        "Y": [1, 4, 3, 6, 5, 7, 8, 9, 7, 10],
+        "Outcome": [0, 0, 0, 1, 1, 1, 1, 1, 1, 1],
+        "Month": list(range(1, 11)),
+    })
+    raw_text = frame.to_csv(index=False)
+    headers = {
+        "X-Rowfirst-Id": "demo-id",
+        "X-Rowfirst-Secret-Key": "demo-secret",
+        "Accept": "application/json",
+    }
+    client = TestClient(app)
+
+    multiple = client.post(
+        "/api/v1/analyze",
+        data={"raw_text": raw_text, "mode": "multiple_regression", "predictor_columns": "X1,X2", "outcome_column": "Y"},
+        headers=headers,
+    )
+    assert multiple.status_code == 200
+    assert multiple.json()["result"]["test"] == "multiple linear regression"
+
+    logistic = client.post(
+        "/api/v1/analyze",
+        data={"raw_text": raw_text, "mode": "logistic_regression", "predictor_columns": "X1,X2", "outcome_column": "Outcome"},
+        headers=headers,
+    )
+    assert logistic.status_code == 200
+    assert logistic.json()["result"]["test"] == "logistic regression"
+
+    forecast = client.post(
+        "/api/v1/analyze",
+        data={"raw_text": raw_text, "mode": "forecast", "outcome_column": "Y", "time_column": "Month", "horizon": "2"},
+        headers=headers,
+    )
+    assert forecast.status_code == 200
+    assert forecast.json()["result"]["test"] == "linear forecast"
+    assert len(forecast.json()["result"]["forecast"]) == 2
+
+    docx_response = client.post(
+        "/api/v1/analyze",
+        data={"raw_text": raw_text, "mode": "multiple_regression", "predictor_columns": "X1,X2", "outcome_column": "Y", "response_format": "docx"},
+        headers={key: value for key, value in headers.items() if key != "Accept"},
+    )
+    assert docx_response.status_code == 200
+    assert docx_response.headers["content-type"].startswith("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
