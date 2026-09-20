@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: rowfirstoriginal
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: ROWFIRST_ID
+        sync: false
+      - key: ROWFIRST_SECRET_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ENABLE_POLLING
+        value: "true"

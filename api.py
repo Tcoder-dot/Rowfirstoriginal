@@ -53,6 +53,12 @@ app.add_middleware(
 )
 
 
+@app.get("/", include_in_schema=False)
+@app.get("/health", include_in_schema=False)
+async def health() -> dict[str, str]:
+    return {"status": "ok", "service": "rowfirst-fastapi"}
+
+
 @app.exception_handler(Exception)
 async def internal_engine_error(_, __: Exception) -> JSONResponse:
     return JSONResponse(status_code=500, content={"detail": "Internal Engine Error"})
