@@ -68,6 +68,26 @@ def parse_pdf(buffer: bytes | bytearray | BytesIO) -> pd.DataFrame:
     return parse_tabular_text(text)
 
 
+def parse_docx_buffer(buffer: bytes | bytearray | BytesIO) -> pd.DataFrame:
+    """Read the first Word table, or tabular text from Word paragraphs."""
+    payload = buffer.getvalue() if isinstance(buffer, BytesIO) else bytes(buffer)
+    try:
+        from docx import Document
+
+        document = Document(BytesIO(payload))
+    except Exception as exc:
+        raise DataParserError(f"Could not read Word file: {exc}") from exc
+    if document.tables:
+        rows = [[cell.text.strip() for cell in row.cells] for row in document.tables[0].rows]
+        if len(rows) < 2:
+            raise DataParserError("Word table must include headers and data rows")
+        return _clean_frame(pd.DataFrame(rows[1:], columns=rows[0]), "Word table")
+    text = "\n".join(paragraph.text for paragraph in document.paragraphs if paragraph.text.strip())
+    if not text:
+        raise DataParserError("Word file contains no tabular data")
+    return parse_tabular_text(text)
+
+
 def parse_image(buffer: bytes | bytearray | BytesIO) -> pd.DataFrame:
     """OCR a table image and normalize the recognized text."""
     payload = buffer.getvalue() if isinstance(buffer, BytesIO) else bytes(buffer)
@@ -84,7 +104,7 @@ def parse_image(buffer: bytes | bytearray | BytesIO) -> pd.DataFrame:
 
 
 def parse_uploaded_file(buffer: bytes | bytearray | BytesIO, filename: str) -> pd.DataFrame:
-    """Dispatch supported uploads to CSV, Excel, PDF, or image parsing."""
+    """Dispatch supported uploads to CSV, Excel, PDF, Word, or image parsing."""
     suffix = Path(filename).suffix.lower()
     if suffix == ".csv":
         return parse_csv_buffer(buffer, filename)
@@ -92,9 +112,11 @@ def parse_uploaded_file(buffer: bytes | bytearray | BytesIO, filename: str) -> p
         return parse_excel_buffer(buffer, filename)
     if suffix == ".pdf":
         return parse_pdf(buffer)
+    if suffix == ".docx":
+        return parse_docx_buffer(buffer)
     if suffix in {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}:
         return parse_image(buffer)
-    raise DataParserError("Supported uploads are CSV, XLSX, XLS, PDF, PNG, JPG, WEBP, TIFF, or BMP")
+    raise DataParserError("Supported uploads are CSV, XLSX, XLS, PDF, DOCX, PNG, JPG, WEBP, TIFF, or BMP")
 
 
 def parse_tabular_text(text: str) -> pd.DataFrame:

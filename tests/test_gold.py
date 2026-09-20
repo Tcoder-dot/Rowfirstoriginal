@@ -16,12 +16,14 @@ from api import app
 from data_parser import (
     DataParserError,
     parse_csv_buffer,
+    parse_docx_buffer,
     parse_excel_buffer,
     parse_image,
     parse_pdf,
     parse_tabular_text,
     parse_uploaded_file,
 )
+from financial_engine import analyze_financial_dataframe
 from handle import build_breakdown
 
 
@@ -29,6 +31,78 @@ def test_parser_delimiters() -> None:
     assert list(parse_csv_buffer(b"Group,Score\nA,1\nB,2\n").columns) == ["Group", "Score"]
     assert parse_tabular_text("Group\tScore\nA\t1").shape == (1, 2)
     assert parse_tabular_text("Group Score\nA 1").shape == (1, 2)
+
+
+def test_financial_engine_returns_kpis_diagnostics_narrative_and_chart() -> None:
+    frame = pd.DataFrame({
+        "Month": ["2026-01", "2026-02", "2026-04"],
+        "Revenue": [100000, 110000, 121000],
+        "Operating Expenses": [40000, 42000, 140000],
+        "Cash Reserves": [200000, 160000, 40000],
+    })
+    result = analyze_financial_dataframe(frame)
+
+    assert result["kpis"]["net_revenue"] == 121000.0
+    assert result["kpis"]["ebitda"] == -19000.0
+    assert abs(result["kpis"]["runway_months"] - 0.5405405405) < 1e-9
+    assert result["kpis"]["revenue_trend"]["r_squared"] is not None
+    assert any(warning["type"] == "mismatched_date_sequence" for warning in result["diagnostics"]["warnings"])
+    assert any(
+        warning["type"] == "negative_cash_flow" and warning["severity"] == "critical"
+        for warning in result["diagnostics"]["warnings"]
+    )
+    assert "Financial Performance Summary:" in result["executive_summary"]
+    assert result["chart_base64"].startswith("iVBORw0KGgo")
+
+
+def test_financial_api_accepts_json_rows() -> None:
+    os.environ["ROWFIRST_ID"] = "demo-id"
+    os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"
+    response = TestClient(app).post(
+        "/api/v1/financial-analysis",
+        json={"rows": [
+            {"Month": "2026-01", "Revenue": 100, "Operating Expenses": 40, "Cash Reserves": 200},
+            {"Month": "2026-02", "Revenue": 110, "Operating Expenses": 45, "Cash Reserves": 155},
+        ]},
+        headers={"X-Rowfirst-Id": "demo-id", "X-Rowfirst-Secret-Key": "demo-secret"},
+    )
+    assert response.status_code == 200
+    assert response.json()["analysis_type"] == "executive_financial"
+
+
+def test_financial_api_accepts_word_upload() -> None:
+    from docx import Document
+
+    os.environ["ROWFIRST_ID"] = "demo-id"
+    os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"
+    document = Document()
+    table = document.add_table(rows=1, cols=4)
+    for cell, header in zip(table.rows[0].cells, ("Month", "Revenue", "Operating Expenses", "Cash Reserves")):
+        cell.text = header
+    for values in (("2026-01", "100", "40", "200"), ("2026-02", "110", "45", "155")):
+        cells = table.add_row().cells
+        for cell, value in zip(cells, values):
+            cell.text = value
+    document_buffer = BytesIO()
+    document.save(document_buffer)
+
+    response = TestClient(app).post(
+        "/api/v1/financial-analysis",
+        files={"file": ("ledger.docx", document_buffer.getvalue(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        headers={"X-Rowfirst-Id": "demo-id", "X-Rowfirst-Secret-Key": "demo-secret"},
+    )
+    assert response.status_code == 200
+    assert response.json()["kpis"]["net_revenue"] == 110.0
+
+
+def test_telegram_polling_requires_token(monkeypatch) -> None:
+    import api as api_module
+
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("BOT_TOKEN", raising=False)
+    api_module._telegram_started = False
+    api_module._start_telegram_polling()
+    assert api_module._telegram_started is False
 
 
 def test_labeled_text_and_analysis() -> None:
@@ -218,6 +292,22 @@ def test_excel_and_pdf_uploads_are_parsed() -> None:
     pdf.save()
     parsed_pdf = parse_pdf(pdf_buffer.getvalue())
     assert list(parsed_pdf.columns) == ["Treatment", "Value"]
+
+    from docx import Document
+
+    docx_buffer = BytesIO()
+    document = Document()
+    table = document.add_table(rows=1, cols=2)
+    table.rows[0].cells[0].text = "Treatment"
+    table.rows[0].cells[1].text = "Value"
+    for treatment, value in (("A", "1"), ("B", "2")):
+        cells = table.add_row().cells
+        cells[0].text = treatment
+        cells[1].text = value
+    document.save(docx_buffer)
+    docx = parse_docx_buffer(docx_buffer.getvalue())
+    assert list(docx.columns) == ["Treatment", "Value"]
+    assert parse_uploaded_file(docx_buffer.getvalue(), "study.docx").shape == (2, 2)
 
 
 def test_image_upload_uses_ocr(monkeypatch) -> None:

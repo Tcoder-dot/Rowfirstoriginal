@@ -1,9 +1,12 @@
 """Standalone REST API for deterministic tabular analysis."""
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from io import BytesIO
+import logging
 import os
 import secrets
+from threading import Lock, Thread
 from typing import Any
 
 from pandas.api.types import is_numeric_dtype, is_object_dtype, is_string_dtype
@@ -14,6 +17,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from analysis_service import analyze_dataframe, generate_docx
 from charts import make_chart_base64
 from data_parser import DataParserError, parse_tabular_text, parse_uploaded_file
+from financial_engine import analyze_financial_dataframe
 
 
 IDENTIFIER_COLUMNS = {
@@ -26,7 +30,16 @@ GROUP_COLUMN_HINTS = {
 }
 
 
-app = FastAPI(title="Rowfirst Analysis API", version="1.0.0")
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    _start_telegram_polling()
+    yield
+
+
+app = FastAPI(title="Rowfirst Analysis API", version="1.0.0", lifespan=_lifespan)
+logger = logging.getLogger("rowfirst.api")
+_telegram_start_lock = Lock()
+_telegram_started = False
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,6 +56,30 @@ app.add_middleware(
 @app.exception_handler(Exception)
 async def internal_engine_error(_, __: Exception) -> JSONResponse:
     return JSONResponse(status_code=500, content={"detail": "Internal Engine Error"})
+
+
+def _start_telegram_polling() -> None:
+    """Start polling once when the Cloud Run service is configured for Telegram."""
+    global _telegram_started
+    token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+    enabled = os.getenv("TELEGRAM_ENABLE_POLLING", "true").lower() not in {"0", "false", "no"}
+    if not token or not enabled:
+        return
+    with _telegram_start_lock:
+        if _telegram_started:
+            return
+        _telegram_started = True
+
+    def poll() -> None:
+        try:
+            from bot import create_bot
+
+            create_bot(token).infinity_polling(skip_pending=True)
+        except Exception:
+            logger.exception("Telegram polling stopped")
+
+    Thread(target=poll, name="telegram-polling", daemon=True).start()
+    logger.info("Telegram polling started")
 
 
 async def _verify_integration(request: Request) -> None:
@@ -398,4 +435,36 @@ async def analyze(
             headers=headers,
         )
     except (DataParserError, ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/financial-analysis", response_model=None)
+@app.post("/api/v1/financial/analyze", response_model=None)
+async def financial_analysis(
+    request: Request,
+    _: None = Depends(_verify_integration),
+) -> JSONResponse:
+    """Return deterministic executive KPIs and diagnostics for a financial ledger."""
+    try:
+        content_type = request.headers.get("content-type", "").lower()
+        if content_type.startswith("multipart/") or content_type.startswith("application/x-www-form-urlencoded"):
+            form = await request.form()
+            file = form.get("file")
+            raw_text = form.get("raw_text")
+            if file is not None and not hasattr(file, "read"):
+                file = None
+            if raw_text is not None and not isinstance(raw_text, str):
+                raw_text = str(raw_text)
+            frame = await _load_frame(file, raw_text)
+        else:
+            payload = await request.json()
+            if isinstance(payload, dict) and isinstance(payload.get("rows"), list):
+                payload = payload["rows"]
+            if not isinstance(payload, list) or not payload:
+                raise DataParserError("Provide a CSV file, raw_text, or a JSON array of ledger rows")
+            import pandas as pd
+
+            frame = pd.DataFrame(payload)
+        return JSONResponse(content=analyze_financial_dataframe(frame))
+    except (DataParserError, ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

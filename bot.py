@@ -22,7 +22,7 @@ from data_parser import DataParserError, parse_tabular_text, parse_uploaded_file
 
 
 UNSUPPORTED_MEDIA_MESSAGE = (
-    "⚠️ Unsupported file type. Please send CSV, Excel, PDF, PNG, JPG, WEBP, TIFF, "
+    "⚠️ Unsupported file type. Please send CSV, Excel, PDF, Word, PNG, JPG, WEBP, TIFF, "
     "or BMP data, or paste your raw table text."
 )
 last_engines: dict[int, dict[str, Any]] = {}
