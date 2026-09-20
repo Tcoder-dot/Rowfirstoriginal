@@ -247,6 +247,9 @@ def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
     monthly["net_margin"] = monthly["operating_margin"]
     monthly["mom_growth_rate"] = monthly["revenue"].pct_change() * 100
 
+    total_net_revenue = float(monthly["revenue"].sum())
+    avg_monthly_burn = float(monthly["total_expenses"].mean())
+    avg_mom_growth = float(monthly["mom_growth_rate"].dropna().mean()) if monthly["mom_growth_rate"].notna().any() else 0.0
     total_expense_mean = float(monthly["total_expenses"].mean())
     legacy_expense_mean = float(monthly["operating_expenses"].mean()) if "operating_expenses" in monthly else total_expense_mean
     current_cash = float(monthly["cash_reserves"].dropna().iloc[-1]) if "cash_reserves" in monthly and monthly["cash_reserves"].notna().any() else None
@@ -297,7 +300,7 @@ def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
         "periods": records,
         "kpis": {
             "net_revenue": float(latest["revenue"]),
-            "total_period_revenue": float(monthly["revenue"].sum()),
+            "total_period_revenue": total_net_revenue,
             "mean_monthly_revenue": float(monthly["revenue"].mean()),
             "period_over_period_growth_rate": latest_growth,
             "mom_growth_rate": latest_growth,
@@ -311,8 +314,14 @@ def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
             "mean_monthly_expenses": legacy_expense_mean,
             "mean_total_operating_expenses": total_expense_mean,
             "mean_monthly_cash_burn": total_expense_mean,
+            "avg_mom_growth": avg_mom_growth,
             "current_cash_reserves": current_cash,
             "runway_months": runway,
+        },
+        "template_context": {
+            "total_net_revenue": total_net_revenue,
+            "avg_monthly_burn": avg_monthly_burn,
+            "avg_mom_growth": avg_mom_growth,
         },
         "diagnostics": {"warnings": warnings, "warning_count": len(warnings)},
         "executive_summary": narrative,

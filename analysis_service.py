@@ -1362,5 +1362,7 @@ def _results(engine: dict[str, Any]) -> list[dict[str, Any]]:
 def _require_engine(engine: dict[str, Any]) -> None:
     if not engine or not engine.get("ok", True):
         raise ValueError("A successful engine JSON result is required.")
+    if engine.get("analysis_type") == "executive_financial":
+        return
     if not _results(engine):
         raise ValueError("Engine JSON contains no result.")
