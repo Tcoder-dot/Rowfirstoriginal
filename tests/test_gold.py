@@ -193,6 +193,33 @@ def test_financial_api_accepts_word_upload() -> None:
     assert response.json()["kpis"]["net_revenue"] == 110.0
 
 
+def test_research_file_uploads_work_without_manual_column_selection() -> None:
+    os.environ["ROWFIRST_ID"] = "demo-id"
+    os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"
+    headers = {"X-Rowfirst-Id": "demo-id", "X-Rowfirst-Secret-Key": "demo-secret"}
+    client = TestClient(app)
+    csv_data = b"Treatment,Value\nA,1\nA,2\nB,4\nB,5\n"
+    response = client.post(
+        "/api/v1/analyze",
+        files={"file": ("study.csv", csv_data, "text/csv")},
+        data={"response_format": "json"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["metric"] == "Value"
+
+    excel_buffer = BytesIO()
+    pd.DataFrame({"Treatment": ["A", "A", "B", "B"], "Value": [1, 2, 4, 5]}).to_excel(excel_buffer, index=False)
+    response = client.post(
+        "/api/v1/analyze",
+        files={"file": ("study.xlsx", excel_buffer.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        data={"response_format": "json"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["metric"] == "Value"
+
+
 def test_telegram_polling_requires_token(monkeypatch) -> None:
     import api as api_module
 

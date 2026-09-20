@@ -173,7 +173,10 @@ def create_bot(token: str) -> Any:
         except (DataParserError, ValueError) as exc:
             bot.reply_to(message, f"⚠️ {exc}")
         except Exception:
-            bot.reply_to(message, "⚠️ Could not process that CSV. Please check the delimiter and columns.")
+            bot.reply_to(
+                message,
+                "⚠️ I could not process that file. Please send a supported CSV, Excel, PDF, Word, or image table with a clear header row.",
+            )
 
     @bot.message_handler(content_types=["text"])
     def text(message: Any) -> None:

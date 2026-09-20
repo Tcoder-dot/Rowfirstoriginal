@@ -441,7 +441,7 @@ def _infer_factor_column(frame: Any, factor_column: str | None = None) -> str:
             for column in frame.columns
             if not any(term in str(column).lower() for term in ignored_factor_names)
             and (is_object_dtype(frame[column]) or is_string_dtype(frame[column]))
-            and frame[column].nunique(dropna=True) < half_row_count
+            and frame[column].nunique(dropna=True) <= half_row_count
         ),
         None,
     )
