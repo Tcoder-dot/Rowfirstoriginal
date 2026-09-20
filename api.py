@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from analysis_service import analyze_dataframe, generate_docx
 from charts import make_chart_base64
 from data_parser import DataParserError, parse_tabular_text, parse_uploaded_file
-from financial_engine import analyze_financial_dataframe
+from financial_engine import analyze_financial_dataframe, is_financial_dataframe
 
 
 IDENTIFIER_COLUMNS = {
@@ -414,6 +414,22 @@ async def analyze(
 ) -> StreamingResponse | JSONResponse:
     try:
         frame = await _load_frame(file, raw_text)
+        if is_financial_dataframe(frame):
+            financial = analyze_financial_dataframe(frame)
+            if response_format.lower() == "json":
+                return JSONResponse(content=financial)
+            if response_format.lower() != "docx":
+                raise DataParserError("response_format must be 'docx' or 'json'")
+            buffer = generate_docx(financial)
+            if not isinstance(buffer, BytesIO):
+                raise RuntimeError("DOCX generator returned an invalid buffer")
+            buffer.seek(0)
+            headers = {"Content-Disposition": 'attachment; filename="Rowfirst_Financial_Report.docx"'}
+            return StreamingResponse(
+                buffer,
+                media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                headers=headers,
+            )
         gate_response = _design_gate(frame, factor_column, metric_column, mode)
         if gate_response is not None:
             return JSONResponse(content=gate_response)

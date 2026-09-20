@@ -15,6 +15,8 @@ from analysis_service import (
     paired_ttest,
     two_way_anova,
 )
+from data_parser import parse_tabular_text
+from financial_engine import analyze_financial_dataframe, is_financial_dataframe
 
 
 UNSUPPORTED = (
@@ -30,6 +32,12 @@ def handle_analyze(req: dict) -> dict:
         text = request.get("text") or ""
         if _is_unsupported(text):
             return {"ok": False, "unsupported": True, "error": UNSUPPORTED}
+        try:
+            financial_frame = parse_tabular_text(text)
+        except Exception:
+            financial_frame = None
+        if financial_frame is not None and is_financial_dataframe(financial_frame):
+            return analyze_financial_dataframe(financial_frame)
         ingested = ingest_text(text)
         engine = analyze_ingested(
             ingested,

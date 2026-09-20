@@ -11,6 +11,7 @@ from typing import Any
 import pandas as pd
 
 from charts import make_chart_base64
+from financial_engine import analyze_financial_dataframe, is_financial_dataframe
 from qa import quality_check
 from stats_engine import (
     analyze_groups,
@@ -33,6 +34,8 @@ def analyze_dataframe(
     generate_chart: bool = True,
 ) -> dict[str, Any]:
     """Run the existing deterministic engine against two selected columns."""
+    if is_financial_dataframe(frame):
+        return analyze_financial_dataframe(frame)
     if factor_column not in frame.columns or metric_column not in frame.columns:
         raise ValueError("factor_column and metric_column must be valid columns")
     if factor_column == metric_column:
@@ -121,6 +124,122 @@ def generate_docx(engine: dict[str, Any], path: str | Path | None = None) -> Byt
     return buffer
 
 
+def _financial_money(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    return f"${float(value):,.2f}"
+
+
+def _financial_rows(engine: dict[str, Any]) -> list[tuple[str, ...]]:
+    rows = []
+    for period in engine.get("periods", []):
+        rows.append((
+            str(period.get("period", "n/a")),
+            _financial_money(period.get("revenue")),
+            _financial_money(period.get("total_expenses")),
+            str(period.get("active_units", "n/a")),
+            _financial_money(period.get("net_operating_cash_flow")),
+        ))
+    return rows
+
+
+def _financial_markdown(engine: dict[str, Any]) -> str:
+    kpis = engine.get("kpis", {})
+    diagnostics = engine.get("diagnostics", {})
+    lines = [
+        "# Executive Financial Performance & Audit Report",
+        "",
+        "## 1 Executive KPI Summary Block",
+        "",
+        f"- Net Revenue & MoM Growth: {_financial_money(kpis.get('total_period_revenue'))} total period revenue; {float(kpis.get('mom_growth_rate', 0.0)):.2f}% latest MoM growth.",
+        f"- Profitability Metrics: Gross Margin {kpis.get('gross_profit_margin', 'n/a')}%; Net Profit Margin {kpis.get('net_profit_margin', 'n/a')}%; EBITDA {_financial_money(kpis.get('ebitda'))}; Operating Margin {kpis.get('operating_margin', 'n/a')}%.",
+        f"- Capital Efficiency & Runway: {_financial_money(kpis.get('current_cash_reserves'))} reserves; {_financial_money(kpis.get('mean_monthly_cash_burn'))} mean monthly cash burn; {kpis.get('runway_months', 'undetermined')} months runway.",
+        "",
+        "## 2 Period-by-Period Financial Matrix (Table 1)",
+        "",
+        *_markdown_table(
+            ["Month/Period", "Mean Monthly Revenue", "Total Operating Expenses", "Active Client/Unit Counts", "Net Operating Cash Flow"],
+            _financial_rows(engine),
+        ),
+        "",
+        "## 3 Automated Risk & Anomaly Diagnostics",
+        "",
+    ]
+    warnings = diagnostics.get("warnings", [])
+    lines.extend(f"- {warning.get('type', 'diagnostic')}: {warning.get('message') or warning.get('period') or warning.get('column') or 'review required'}" for warning in warnings)
+    if not warnings:
+        lines.append("- No anomalies detected against the configured diagnostics thresholds.")
+    lines.extend(["", "## 4 Strategic Recommendations & Visualization", "", "- Review burn-rate and expense-spike periods against unit economics and protect runway through targeted operating-cost controls.", "- Executive chart suite: revenue vs total expenses, EBITDA vs operating cash flow, and margins vs active clients/units."])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _write_financial_docx(engine: dict[str, Any], path: str | Path | BytesIO) -> str | BytesIO:
+    from docx import Document
+
+    destination = path
+    if isinstance(destination, (str, Path)):
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    kpis = engine.get("kpis", {})
+    document = Document()
+    document.add_heading("Executive Financial Performance & Audit Report", level=1)
+    document.add_paragraph("Authoritative, concise, professional, and data-driven.")
+    document.add_heading("1 Executive KPI Summary Block", level=2)
+    document.add_paragraph(f"Net Revenue & MoM Growth: {_financial_money(kpis.get('total_period_revenue'))} total period revenue; {float(kpis.get('mom_growth_rate', 0.0)):.2f}% latest MoM growth.")
+    document.add_paragraph(f"Profitability Metrics: Gross Margin {kpis.get('gross_profit_margin', 'n/a')}%; Net Profit Margin {kpis.get('net_profit_margin', 'n/a')}%; EBITDA {_financial_money(kpis.get('ebitda'))}; Operating Margin {kpis.get('operating_margin', 'n/a')}%.")
+    document.add_paragraph(f"Capital Efficiency & Runway: {_financial_money(kpis.get('current_cash_reserves'))} reserves; {_financial_money(kpis.get('mean_monthly_cash_burn'))} mean monthly cash burn; {kpis.get('runway_months', 'undetermined')} months runway.")
+    document.add_heading("2 Period-by-Period Financial Matrix (Table 1)", level=2)
+    _add_docx_table(document, ["Month/Period", "Mean Monthly Revenue", "Total Operating Expenses", "Active Client/Unit Counts", "Net Operating Cash Flow"], _financial_rows(engine))
+    document.add_heading("3 Automated Risk & Anomaly Diagnostics", level=2)
+    for warning in engine.get("diagnostics", {}).get("warnings", []) or [{"message": "No anomalies detected against the configured diagnostics thresholds."}]:
+        document.add_paragraph(str(warning.get("message") or warning.get("type") or warning.get("period")), style="List Bullet")
+    document.add_heading("4 Strategic Recommendations & Visualization", level=2)
+    document.add_paragraph("Review burn-rate and expense-spike periods against unit economics and protect runway through targeted operating-cost controls.")
+    _embed_financial_chart(document, engine)
+    document.save(destination)
+    return str(destination) if isinstance(destination, Path) else destination
+
+
+def _embed_financial_chart(document: Any, engine: dict[str, Any]) -> None:
+    from docx.shared import Inches
+
+    charts = engine.get("charts_base64") or [engine.get("chart_base64")]
+    titles = ("Monthly Revenue vs Operating Expenses", "Monthly EBITDA and Operating Cash Flow", "Monthly Margins and Active Units")
+    for title, chart_base64 in zip(titles, charts):
+        if chart_base64:
+            document.add_paragraph(title)
+            document.add_picture(BytesIO(base64.b64decode(chart_base64)), width=Inches(6.2))
+
+
+def _write_financial_pdf(engine: dict[str, Any], path: str | Path) -> str:
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="FinancialBody", parent=styles["BodyText"], alignment=TA_LEFT, leading=14))
+    kpis = engine.get("kpis", {})
+    story = [Paragraph("Executive Financial Performance & Audit Report", styles["Title"]), Paragraph("1 Executive KPI Summary Block", styles["Heading2"])]
+    story.extend(Paragraph(text, styles["FinancialBody"]) for text in (
+        f"Net Revenue & MoM Growth: {_financial_money(kpis.get('total_period_revenue'))} total period revenue; {float(kpis.get('mom_growth_rate', 0.0)):.2f}% latest MoM growth.",
+        f"Profitability Metrics: Gross Margin {kpis.get('gross_profit_margin', 'n/a')}%; Net Profit Margin {kpis.get('net_profit_margin', 'n/a')}%; EBITDA {_financial_money(kpis.get('ebitda'))}; Operating Margin {kpis.get('operating_margin', 'n/a')}%.",
+        f"Capital Efficiency & Runway: {_financial_money(kpis.get('current_cash_reserves'))} reserves; {_financial_money(kpis.get('mean_monthly_cash_burn'))} mean monthly cash burn; {kpis.get('runway_months', 'undetermined')} months runway.",
+    ))
+    story.extend([Spacer(1, 0.12 * inch), Paragraph("2 Period-by-Period Financial Matrix (Table 1)", styles["Heading2"]), _pdf_table(["Month/Period", "Mean Monthly Revenue", "Total Operating Expenses", "Active Client/Unit Counts", "Net Operating Cash Flow"], _financial_rows(engine), styles), Paragraph("3 Automated Risk & Anomaly Diagnostics", styles["Heading2"])])
+    story.extend(Paragraph(str(warning.get("message") or warning.get("type") or warning.get("period")), styles["FinancialBody"]) for warning in engine.get("diagnostics", {}).get("warnings", []) or [{"message": "No anomalies detected against the configured diagnostics thresholds."}])
+    story.append(Paragraph("4 Strategic Recommendations & Visualization", styles["Heading2"]))
+    story.append(Paragraph("Review burn-rate and expense-spike periods against unit economics and protect runway through targeted operating-cost controls.", styles["FinancialBody"]))
+    for chart_base64 in engine.get("charts_base64") or [engine.get("chart_base64")]:
+        if chart_base64:
+            story.append(Image(BytesIO(base64.b64decode(chart_base64)), width=7.0 * inch, height=3.5 * inch))
+    SimpleDocTemplate(str(destination), pagesize=letter, rightMargin=0.55 * inch, leftMargin=0.55 * inch, topMargin=0.55 * inch, bottomMargin=0.55 * inch).build(story)
+    return str(destination)
+
+
 def _clean_document_text(text: str) -> str:
     if not text:
         return text
@@ -135,6 +254,8 @@ def _clean_document_text(text: str) -> str:
 
 def to_markdown(engine: dict[str, Any]) -> str:
     _require_engine(engine)
+    if engine.get("analysis_type") == "executive_financial":
+        return _financial_markdown(engine)
     results = _results(engine)
     lines = [f"# {_clean_document_text(TITLE)}", "", "## 1 Study and design", "", *[_clean_document_text(line) for line in _preamble(engine, results)], ""]
 
@@ -183,6 +304,8 @@ def write_docx(engine: dict[str, Any], path: str | Path | BytesIO) -> str | Byte
     from docx import Document
 
     _require_engine(engine)
+    if engine.get("analysis_type") == "executive_financial":
+        return _write_financial_docx(engine, path)
     destination = path
     if isinstance(destination, (str, Path)):
         destination = Path(destination)
@@ -246,6 +369,8 @@ def write_pdf(engine: dict[str, Any], path: str | Path) -> str:
     from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
 
     _require_engine(engine)
+    if engine.get("analysis_type") == "executive_financial":
+        return _write_financial_pdf(engine, path)
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     results = _results(engine)

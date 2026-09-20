@@ -19,6 +19,7 @@ except ImportError:  # pragma: no cover
 
 from analysis_service import analyze_dataframe, generate_docx
 from data_parser import DataParserError, parse_tabular_text, parse_uploaded_file
+from financial_engine import analyze_financial_dataframe, is_financial_dataframe
 
 
 UNSUPPORTED_MEDIA_MESSAGE = (
@@ -63,14 +64,19 @@ def _choose_columns(frame: Any) -> tuple[str, str]:
 
 
 def _analyze_and_send(bot: Any, message: Any, frame: Any) -> None:
-    factor_column, metric_column = _choose_columns(frame)
-    engine = analyze_dataframe(frame, factor_column, metric_column)
+    if is_financial_dataframe(frame):
+        engine = analyze_financial_dataframe(frame)
+        filename = "Rowfirst_Financial_Report.docx"
+    else:
+        factor_column, metric_column = _choose_columns(frame)
+        engine = analyze_dataframe(frame, factor_column, metric_column)
+        filename = "Rowfirst_Results.docx"
     last_engines[message.chat.id] = engine
     with tempfile.TemporaryDirectory(prefix="rowfirst-results-") as directory:
-        path = Path(directory) / "Rowfirst_Results.docx"
+        path = Path(directory) / filename
         generate_docx(engine, path)
         with path.open("rb") as report:
-            bot.send_document(message.chat.id, report, caption="Rowfirst_Results.docx")
+            bot.send_document(message.chat.id, report, caption=filename)
 
 
 def _send_invoice(bot: Any, message: Any) -> None:

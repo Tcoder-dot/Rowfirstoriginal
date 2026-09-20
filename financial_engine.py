@@ -18,6 +18,7 @@ DATE_ALIASES = {"date", "month", "period", "monthdate", "transactiondate"}
 REVENUE_ALIASES = {"revenue", "revenues", "revenueusd", "netrevenue", "netrevenueusd", "sales", "salesusd", "income", "turnover"}
 CASH_ALIASES = {"cashreserves", "cashreservesusd", "cashreserve", "cashreserveusd", "cash", "cashusd", "cashbalance", "endingcash"}
 COGS_ALIASES = {"cogs", "costofgoods sold", "costofgoodssold", "costofsales"}
+ACTIVE_ALIASES = {"activeclients", "activeclientcount", "activeunits", "activeunitcount", "customers", "units"}
 EXPENSE_ALIASES = {
     "operatingexpenses": "operating_expenses",
     "operatingexpensesusd": "operating_expenses",
@@ -96,7 +97,18 @@ def _expense_field(column: str) -> str:
     return EXPENSE_ALIASES[_key(column)]
 
 
-def _monthly_frame(frame: pd.DataFrame, date_column: str, revenue_column: str, cash_column: str | None, cogs_column: str | None, expense_columns: list[str]) -> pd.DataFrame:
+def is_financial_dataframe(frame: pd.DataFrame) -> bool:
+    """Return whether a frame has the minimum shape of a financial time series."""
+    if frame.empty:
+        return False
+    return bool(
+        _find_column(frame, DATE_ALIASES)
+        and _find_column(frame, REVENUE_ALIASES)
+        and _expense_columns(frame)
+    )
+
+
+def _monthly_frame(frame: pd.DataFrame, date_column: str, revenue_column: str, cash_column: str | None, cogs_column: str | None, active_column: str | None, expense_columns: list[str]) -> pd.DataFrame:
     working = pd.DataFrame(index=frame.index)
     working["period"] = pd.to_datetime(frame[date_column], format="mixed", errors="coerce").dt.to_period("M").astype("string")
     working["revenue"] = _number_series(frame, revenue_column)
@@ -107,10 +119,14 @@ def _monthly_frame(frame: pd.DataFrame, date_column: str, revenue_column: str, c
         working["cash_reserves"] = _number_series(frame, cash_column)
     if cogs_column:
         working["cogs"] = _number_series(frame, cogs_column)
+    if active_column:
+        working["active_units"] = _number_series(frame, active_column)
     working = working.dropna(subset=["period"])
-    aggregations: dict[str, str] = {column: "sum" for column in working.columns if column not in {"period", "cash_reserves"}}
+    aggregations: dict[str, str] = {column: "sum" for column in working.columns if column not in {"period", "cash_reserves", "active_units"}}
     if cash_column:
         aggregations["cash_reserves"] = "last"
+    if active_column:
+        aggregations["active_units"] = "last"
     return working.groupby("period", sort=True).agg(aggregations).reset_index()
 
 
@@ -151,6 +167,57 @@ def _chart_base64(monthly: pd.DataFrame) -> str | None:
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
+def _encode_figure(figure: Any) -> str:
+    buffer = BytesIO()
+    figure.savefig(buffer, format="png", dpi=160, facecolor=figure.get_facecolor())
+    plt.close(figure)
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _chart_suite_base64(monthly: pd.DataFrame) -> list[str]:
+    """Return the executive chart suite while preserving the legacy primary chart."""
+    if monthly.empty:
+        return []
+    periods = monthly["period"].astype(str).tolist()
+    x_values = np.arange(len(monthly), dtype=float)
+    charts = [_chart_base64(monthly)]
+
+    figure, axis = plt.subplots(figsize=(11, 5.5), facecolor="#120d1f")
+    axis.set_facecolor("#120d1f")
+    axis.axhline(0, color="#c4b5fd", linewidth=1, alpha=0.5)
+    axis.bar(x_values - 0.18, monthly["ebitda"], width=0.36, color="#a78bfa", label="EBITDA")
+    axis.bar(x_values + 0.18, monthly["net_operating_cash_flow"], width=0.36, color="#fb7185", label="Net operating cash flow")
+    axis.set_xticks(x_values, periods, rotation=45, ha="right")
+    axis.set_ylabel("Cash flow", color="#f8fafc")
+    axis.set_title("Monthly EBITDA and Operating Cash Flow", color="#f8fafc")
+    axis.tick_params(colors="#f8fafc")
+    axis.grid(axis="y", color="#6b5a83", alpha=0.25)
+    axis.legend(facecolor="#241631", labelcolor="#f8fafc")
+    charts.append(_encode_figure(figure))
+
+    figure, margin_axis = plt.subplots(figsize=(11, 5.5), facecolor="#120d1f")
+    margin_axis.set_facecolor("#120d1f")
+    margin_axis.plot(x_values, monthly["gross_margin"], color="#67e8f9", marker="o", linewidth=2.5, label="Gross margin")
+    margin_axis.plot(x_values, monthly["operating_margin"], color="#fbbf24", marker="o", linewidth=2.5, label="Operating margin")
+    if "active_units" in monthly:
+        unit_axis = margin_axis.twinx()
+        unit_axis.plot(x_values, monthly["active_units"], color="#86efac", marker="s", linewidth=2.2, label="Active clients/units")
+        unit_axis.set_ylabel("Active clients/units", color="#86efac")
+        unit_axis.tick_params(colors="#86efac")
+        handles_b, labels_b = unit_axis.get_legend_handles_labels()
+    else:
+        handles_b, labels_b = [], []
+    margin_axis.set_xticks(x_values, periods, rotation=45, ha="right")
+    margin_axis.set_ylabel("Margin (%)", color="#f8fafc")
+    margin_axis.set_title("Monthly Margins and Active Units", color="#f8fafc")
+    margin_axis.tick_params(colors="#f8fafc")
+    margin_axis.grid(axis="y", color="#6b5a83", alpha=0.25)
+    handles_a, labels_a = margin_axis.get_legend_handles_labels()
+    margin_axis.legend(handles_a + handles_b, labels_a + labels_b, facecolor="#241631", labelcolor="#f8fafc")
+    charts.append(_encode_figure(figure))
+    return [chart for chart in charts if chart]
+
+
 def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
     """Analyze a ledger with one row per transaction or month."""
     if frame.empty:
@@ -159,6 +226,7 @@ def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
     revenue_column = _find_column(frame, REVENUE_ALIASES)
     cash_column = _find_column(frame, CASH_ALIASES)
     cogs_column = _find_column(frame, COGS_ALIASES)
+    active_column = _find_column(frame, ACTIVE_ALIASES)
     expense_columns = _expense_columns(frame)
     if not date_column or not revenue_column:
         raise ValueError("Financial ledger requires a Date or Month column and a Revenue column")
@@ -166,14 +234,11 @@ def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
         raise ValueError("Financial ledger requires Operating Expenses, Payroll, or Marketing Spend")
 
     warnings = _diagnostics(frame, date_column, revenue_column, expense_columns)
-    monthly = _monthly_frame(frame, date_column, revenue_column, cash_column, cogs_column, expense_columns)
+    monthly = _monthly_frame(frame, date_column, revenue_column, cash_column, cogs_column, active_column, expense_columns)
     if monthly.empty:
         raise ValueError("No valid financial periods were found")
-    if "operating_expenses" in monthly:
-        monthly["total_expenses"] = monthly["operating_expenses"]
-    else:
-        component_columns = [_key(column) for column in expense_columns]
-        monthly["total_expenses"] = monthly[component_columns].sum(axis=1, min_count=1)
+    expense_fields = [_expense_field(column) for column in expense_columns]
+    monthly["total_expenses"] = monthly[expense_fields].sum(axis=1, min_count=1)
     monthly["ebitda"] = monthly["revenue"] - monthly["total_expenses"]
     monthly["net_operating_cash_flow"] = monthly["ebitda"]
     monthly["gross_profit"] = monthly["revenue"] - monthly.get("cogs", monthly["total_expenses"])
@@ -182,9 +247,10 @@ def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
     monthly["net_margin"] = monthly["operating_margin"]
     monthly["mom_growth_rate"] = monthly["revenue"].pct_change() * 100
 
-    expense_mean = float(monthly["total_expenses"].mean())
+    total_expense_mean = float(monthly["total_expenses"].mean())
+    legacy_expense_mean = float(monthly["operating_expenses"].mean()) if "operating_expenses" in monthly else total_expense_mean
     current_cash = float(monthly["cash_reserves"].dropna().iloc[-1]) if "cash_reserves" in monthly and monthly["cash_reserves"].notna().any() else None
-    runway = current_cash / expense_mean if current_cash is not None and expense_mean > 0 else None
+    runway = current_cash / total_expense_mean if current_cash is not None and total_expense_mean > 0 else None
     revenue_regression = _regression(monthly["revenue"])
     growth_values = monthly["mom_growth_rate"].replace([np.inf, -np.inf], np.nan).dropna()
     growth_regression = _regression(growth_values)
@@ -231,6 +297,8 @@ def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
         "periods": records,
         "kpis": {
             "net_revenue": float(latest["revenue"]),
+            "total_period_revenue": float(monthly["revenue"].sum()),
+            "mean_monthly_revenue": float(monthly["revenue"].mean()),
             "period_over_period_growth_rate": latest_growth,
             "mom_growth_rate": latest_growth,
             "revenue_trend": revenue_regression,
@@ -240,7 +308,9 @@ def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
             "net_profit_margin": float(latest["net_margin"]) if pd.notna(latest["net_margin"]) else None,
             "ebitda": latest_ebitda,
             "operating_margin": latest_margin,
-            "mean_monthly_expenses": expense_mean,
+            "mean_monthly_expenses": legacy_expense_mean,
+            "mean_total_operating_expenses": total_expense_mean,
+            "mean_monthly_cash_burn": total_expense_mean,
             "current_cash_reserves": current_cash,
             "runway_months": runway,
         },
@@ -248,4 +318,5 @@ def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
         "executive_summary": narrative,
         "executive_text_blocks": [narrative],
         "chart_base64": _chart_base64(monthly),
+        "charts_base64": _chart_suite_base64(monthly),
     }
