@@ -15,17 +15,21 @@ from scipy.stats import linregress
 
 
 DATE_ALIASES = {"date", "month", "period", "monthdate", "transactiondate"}
-REVENUE_ALIASES = {"revenue", "netrevenue", "sales", "income", "turnover"}
-CASH_ALIASES = {"cashreserves", "cashreserve", "cash", "cashbalance", "endingcash"}
+REVENUE_ALIASES = {"revenue", "revenues", "revenueusd", "netrevenue", "netrevenueusd", "sales", "salesusd", "income", "turnover"}
+CASH_ALIASES = {"cashreserves", "cashreservesusd", "cashreserve", "cashreserveusd", "cash", "cashusd", "cashbalance", "endingcash"}
 COGS_ALIASES = {"cogs", "costofgoods sold", "costofgoodssold", "costofsales"}
 EXPENSE_ALIASES = {
     "operatingexpenses": "operating_expenses",
+    "operatingexpensesusd": "operating_expenses",
     "operatingexpense": "operating_expenses",
+    "operatingexpenseusd": "operating_expenses",
     "opex": "operating_expenses",
     "payroll": "payroll",
+    "payrollusd": "payroll",
     "salaries": "payroll",
     "wages": "payroll",
     "marketingspend": "marketing_spend",
+    "marketingspendusd": "marketing_spend",
     "marketing": "marketing_spend",
     "advertising": "marketing_spend",
 }
@@ -65,7 +69,7 @@ def _diagnostics(frame: pd.DataFrame, date_column: str, revenue_column: str, exp
         missing = int(frame[column].isna().sum())
         if missing:
             warnings.append({"type": "missing_values", "column": column, "count": missing})
-    dates = pd.to_datetime(frame[date_column], errors="coerce")
+    dates = pd.to_datetime(frame[date_column], format="mixed", errors="coerce")
     invalid_dates = int(dates.isna().sum())
     if invalid_dates:
         warnings.append({"type": "invalid_dates", "column": date_column, "count": invalid_dates})
@@ -88,12 +92,17 @@ def _expense_columns(frame: pd.DataFrame) -> list[str]:
     return [str(column) for column in frame.columns if _key(column) in EXPENSE_ALIASES]
 
 
+def _expense_field(column: str) -> str:
+    return EXPENSE_ALIASES[_key(column)]
+
+
 def _monthly_frame(frame: pd.DataFrame, date_column: str, revenue_column: str, cash_column: str | None, cogs_column: str | None, expense_columns: list[str]) -> pd.DataFrame:
     working = pd.DataFrame(index=frame.index)
-    working["period"] = pd.to_datetime(frame[date_column], errors="coerce").dt.to_period("M").astype("string")
+    working["period"] = pd.to_datetime(frame[date_column], format="mixed", errors="coerce").dt.to_period("M").astype("string")
     working["revenue"] = _number_series(frame, revenue_column)
     for column in expense_columns:
-        working[_key(column)] = _number_series(frame, column)
+        field = _expense_field(column)
+        working[field] = _number_series(frame, column)
     if cash_column:
         working["cash_reserves"] = _number_series(frame, cash_column)
     if cogs_column:
@@ -180,8 +189,10 @@ def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
     growth_values = monthly["mom_growth_rate"].replace([np.inf, -np.inf], np.nan).dropna()
     growth_regression = _regression(growth_values)
 
-    for column in [column for column in expense_columns if _key(column) in monthly]:
-        normalized = _key(column)
+    for column in expense_columns:
+        normalized = _expense_field(column)
+        if normalized not in monthly:
+            continue
         values = monthly[normalized].astype(float)
         mean = float(values.mean())
         standard_deviation = float(values.std(ddof=0))

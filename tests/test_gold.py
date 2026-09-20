@@ -55,6 +55,22 @@ def test_financial_engine_returns_kpis_diagnostics_narrative_and_chart() -> None
     assert result["chart_base64"].startswith("iVBORw0KGgo")
 
 
+def test_financial_engine_accepts_currency_suffixed_headers() -> None:
+    frame = pd.DataFrame({
+        "Month": ["Jan", "Feb", "Mar"],
+        "Department": ["Operations"] * 3,
+        "Revenue_USD": [45000, 48000, 52000],
+        "Operating_Expenses_USD": [12000, 11500, 13000],
+        "Payroll_USD": [18000, 18000, 18500],
+        "Marketing_Spend_USD": [5000, 4500, 6000],
+        "Active_Clients": [120, 125, 135],
+    })
+    result = analyze_financial_dataframe(frame)
+
+    assert result["kpis"]["net_revenue"] == 52000.0
+    assert abs(result["kpis"]["mean_monthly_expenses"] - 12166.666666666666) < 1e-9
+
+
 def test_financial_api_accepts_json_rows() -> None:
     os.environ["ROWFIRST_ID"] = "demo-id"
     os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"
