@@ -341,6 +341,35 @@ def test_api_metric_picker_ignores_time_fields_for_finance_batch_analysis() -> N
     ]
 
 
+def test_api_auto_infers_named_group_columns_without_asking() -> None:
+    from api import _design_gate, _infer_factor_column
+
+    frame = pd.DataFrame({
+        "Product": ["A", "A", "B", "B", "C", "C", "A", "A", "B", "B", "C", "C"],
+        "Revenue": [100, 120, 90, 110, 130, 150, 95, 115, 105, 125, 140, 160],
+        "Week": [1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2],
+        "Row_ID": list(range(12)),
+    })
+    assert _infer_factor_column(frame) == "Product"
+    gate = _design_gate(frame, None, None, None)
+    assert gate is None
+
+
+def test_backend_auto_infers_generic_non_id_group_and_excludes_plot_patient_as_outcomes() -> None:
+    from api import _design_gate, _infer_factor_column, _numeric_metric_columns
+
+    frame = pd.DataFrame({
+        "Plot": ["North", "North", "South", "South", "East", "East", "North", "North", "South", "South", "East", "East"],
+        "Revenue": [100, 110, 120, 130, 140, 150, 105, 115, 125, 135, 145, 155],
+        "Patient": ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12"],
+        "Shift": ["AM", "AM", "PM", "PM", "AM", "AM", "PM", "PM", "AM", "AM", "PM", "PM"],
+        "Week": [1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2],
+    })
+    assert _infer_factor_column(frame) == "Plot"
+    assert _design_gate(frame, None, None, None) is None
+    assert _numeric_metric_columns(frame, "Plot") == ["Revenue"]
+
+
 def test_docx_generation() -> None:
     frame = pd.DataFrame({"Treatment": ["A", "A", "B", "B"], "Value": [1, 2, 4, 5]})
     engine = analyze_dataframe(frame, "Treatment", "Value")

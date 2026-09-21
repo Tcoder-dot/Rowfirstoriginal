@@ -37,6 +37,10 @@ IDENTIFIER_COLUMNS = {
 }
 DISALLOWED_METRIC_TOKENS = (
     "week", "month", "year", "date", "index", "rowid", "recordid", "id",
+    "uuid", "time", "day", "timestamp", "plot", "patient", "shift",
+)
+DISALLOWED_GROUP_TOKENS = (
+    "week", "month", "year", "date", "index", "rowid", "recordid", "id",
     "uuid", "time", "day", "timestamp",
 )
 MAX_REQUEST_BYTES = int(os.getenv("ROWFIRST_MAX_REQUEST_BYTES", str(50 * 1024 * 1024)))
@@ -48,7 +52,9 @@ _analysis_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ANALYSES)
 GROUP_COLUMN_HINTS = {
     "treatment", "group", "groups", "arm", "method", "methods", "condition",
     "department", "category", "type", "variant", "segment", "region", "cohort",
+    "product", "branch",
 }
+AUTO_FACTOR_NAMES = {"product", "treatment", "branch", "department", "group", "arm", "variant"}
 
 
 @asynccontextmanager
@@ -282,6 +288,34 @@ def _is_disallowed_metric_column(column: Any) -> bool:
     return any(token in key for token in DISALLOWED_METRIC_TOKENS)
 
 
+def _is_valid_group_candidate(frame: Any, column: Any) -> bool:
+    key = _column_key(column)
+    if not key or key in {"", "week", "month", "year", "date", "index", "rowid", "recordid", "id", "uuid", "time", "day", "timestamp"}:
+        return False
+    if _is_identifier_column(column):
+        return False
+    if any(token in key for token in DISALLOWED_GROUP_TOKENS):
+        return False
+    if is_numeric_dtype(frame[column]):
+        return False
+    if not (is_object_dtype(frame[column]) or is_string_dtype(frame[column])):
+        return False
+    counts = frame[column].dropna().value_counts()
+    if not 2 <= len(counts) <= 8:
+        return False
+    if counts.min() < 2:
+        return False
+    return True
+
+
+def _named_factor_column(frame: Any) -> str | None:
+    for column in frame.columns:
+        key = _column_key(column)
+        if key in AUTO_FACTOR_NAMES and _is_valid_group_candidate(frame, column):
+            return str(column)
+    return None
+
+
 def _profile_mode(frame: Any, factor_column: str) -> dict[str, Any]:
     if factor_column not in frame.columns:
         raise DataParserError(f"Unknown profile column: {factor_column}")
@@ -340,12 +374,10 @@ def _design_gate(
 
     candidate_factor = factor_column
     if not candidate_factor:
-        obvious = [
-            str(column) for column in frame.columns
-            if any(hint in _column_key(column) for hint in GROUP_COLUMN_HINTS)
-            and (is_object_dtype(frame[column]) or is_string_dtype(frame[column]))
-        ]
-        candidate_factor = obvious[0] if obvious else None
+        try:
+            candidate_factor = _infer_factor_column(frame)
+        except DataParserError:
+            candidate_factor = None
     if not candidate_factor:
         return {
             "mode": "ask",
@@ -476,6 +508,11 @@ def _infer_factor_column(frame: Any, factor_column: str | None = None) -> str:
         if factor_column not in frame.columns:
             raise DataParserError(f"Unknown factor column: {factor_column}")
         return str(factor_column)
+
+    named = _named_factor_column(frame)
+    if named is not None:
+        return named
+
     ignored_factor_names = ("id", "record", "index")
     half_row_count = len(frame) * 0.5
     inferred = next(
@@ -483,7 +520,7 @@ def _infer_factor_column(frame: Any, factor_column: str | None = None) -> str:
             str(column)
             for column in frame.columns
             if not any(term in str(column).lower() for term in ignored_factor_names)
-            and (is_object_dtype(frame[column]) or is_string_dtype(frame[column]))
+            and _is_valid_group_candidate(frame, column)
             and frame[column].nunique(dropna=True) <= half_row_count
         ),
         None,
