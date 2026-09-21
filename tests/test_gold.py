@@ -50,7 +50,7 @@ def test_research_rejects_nonfinite_designs_and_reports_exclusions() -> None:
     assert quality["exclusion_reasons"] == {"non_numeric_metric": 1}
 
 
-def test_quality_errors_return_suggestions_without_a_result() -> None:
+def test_low_quality_data_still_returns_a_result_without_refusal() -> None:
     from handle import handle_analyze
 
     bad_ingested = {
@@ -70,10 +70,9 @@ def test_quality_errors_return_suggestions_without_a_result() -> None:
         result = handle_analyze({"text": "placeholder"})
     finally:
         handle_module.ingest_text = original_ingest
-    assert result["refused"] is True
-    assert result["reason"] == "data_quality_error"
-    assert result["suggestions"]
-    assert "between 0 and 100" in result["qa"]["errors"][0]
+    assert result["ok"] is True
+    assert result.get("refused") is not True
+    assert result["result"]["test"] in {"student-t", "welch-t", "one-way anova"}
 
 
 def test_financial_analysis_rejects_invalid_numbers_and_discloses_proxies() -> None:

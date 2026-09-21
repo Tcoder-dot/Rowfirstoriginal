@@ -12,7 +12,6 @@ import pandas as pd
 
 from charts import make_chart_base64
 from financial_engine import analyze_financial_dataframe, is_financial_dataframe
-from qa import quality_check
 from stats_engine import (
     analyze_groups,
     chi_or_fisher,
@@ -116,11 +115,6 @@ def analyze_dataframe(
                 "descriptive statistics are reported instead."
             ),
         }
-    engine["qa"] = quality_check(ingested)
-    if not engine["qa"]["ok"]:
-        details = "; ".join(engine["qa"].get("errors", []))
-        suggestions = " Suggestions: " + " ".join(engine["qa"].get("suggestions", []))
-        raise ValueError(details + suggestions)
     engine["breakdown"] = build_breakdown(engine)
     engine["factor"] = str(factor_column)
     engine["metric"] = str(metric_column)

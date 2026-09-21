@@ -8,7 +8,6 @@ from typing import Any
 import pandas as pd
 
 from ingest import ingest_text
-from qa import quality_check
 from analysis_service import (
     analyze_groups,
     chi_or_fisher,
@@ -60,16 +59,6 @@ def handle_analyze(req: dict) -> dict:
             mode=requested_mode,
             outcome_name=_requested_outcome(request),
         )
-        engine["qa"] = quality_check(ingested)
-        if not engine["qa"]["ok"]:
-            return {
-                "ok": False,
-                "refused": True,
-                "reason": "data_quality_error",
-                "ingested": ingested,
-                "qa": engine["qa"],
-                "suggestions": engine["qa"].get("suggestions", []),
-            }
         engine["breakdown"] = build_breakdown(engine)
         if request.get("study") or request.get("topic"):
             engine["topic"] = request.get("topic") or request.get("study")
