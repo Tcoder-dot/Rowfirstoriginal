@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import base64
+import json
 from io import BytesIO
 import tempfile
 import zipfile
@@ -219,6 +220,65 @@ def test_research_file_uploads_work_without_manual_column_selection() -> None:
     assert response.status_code == 200
     assert response.json()["metric"] == "Value"
 
+
+def test_batch_analysis_processes_items_sequentially_with_isolated_errors() -> None:
+    os.environ["ROWFIRST_ID"] = "demo-id"
+    os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"
+    headers = {"X-Rowfirst-Id": "demo-id", "X-Rowfirst-Secret-Key": "demo-secret"}
+    response = TestClient(app).post(
+        "/api/v1/batch-analyze",
+        json={"items": [
+            {"name": "study-a", "raw_text": "Treatment,Value\nA,1\nA,2\nB,4\nB,5\n"},
+            {"name": "bad-item", "raw_text": "not a table"},
+            {"name": "study-b", "raw_text": "Treatment,Value\nA,2\nA,3\nB,5\nB,6\n"},
+        ]},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["batch"] is True
+    assert payload["count"] == 3
+    assert [item["status"] for item in payload["results"]] == ["success", "error", "success"]
+
+
+def test_batch_analysis_accepts_multiple_uploaded_files() -> None:
+    os.environ["ROWFIRST_ID"] = "demo-id"
+    os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"
+    headers = {"X-Rowfirst-Id": "demo-id", "X-Rowfirst-Secret-Key": "demo-secret"}
+    csv_a = b"Treatment,Value\nA,1\nA,2\nB,4\nB,5\n"
+    csv_b = b"Treatment,Value\nA,2\nA,3\nB,5\nB,6\n"
+    response = TestClient(app).post(
+        "/api/v1/batch-analyze",
+        files=[
+            ("files", ("study-a.csv", csv_a, "text/csv")),
+            ("files", ("study-b.csv", csv_b, "text/csv")),
+        ],
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert [item["name"] for item in response.json()["results"]] == ["study-a.csv", "study-b.csv"]
+
+
+def test_batch_download_returns_zip_reports_and_manifest() -> None:
+    os.environ["ROWFIRST_ID"] = "demo-id"
+    os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"
+    response = TestClient(app).post(
+        "/api/v1/batch-analyze/download",
+        json={"items": [
+            {"name": "study-a", "raw_text": "Treatment,Value\nA,1\nA,2\nB,4\nB,5\n"},
+            {"name": "study-b", "raw_text": "Treatment,Value\nA,2\nA,3\nB,5\nB,6\n"},
+        ]},
+        headers={"X-Rowfirst-Id": "demo-id", "X-Rowfirst-Secret-Key": "demo-secret"},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/zip")
+    with zipfile.ZipFile(BytesIO(response.content)) as archive:
+        names = archive.namelist()
+        assert "manifest.json" in names
+        assert "001_study-a.docx" in names
+        assert "002_study-b.docx" in names
+        manifest = json.loads(archive.read("manifest.json"))
+        assert [item["status"] for item in manifest["items"]] == ["success", "success"]
 
 def test_telegram_polling_requires_token(monkeypatch) -> None:
     import api as api_module

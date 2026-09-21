@@ -8,6 +8,7 @@ import logging
 import os
 import secrets
 import time
+import zipfile
 from uuid import uuid4
 from threading import Lock, Thread
 from typing import Any
@@ -208,6 +209,26 @@ async def _analyze_request(
 ) -> tuple[list[dict[str, Any]], str]:
     frame = await _load_frame(file, raw_text)
     return _analyze_frame(frame, factor_column, metric_column)
+
+
+def _batch_item_result(frame: Any, name: str, factor_column: str | None, metric_column: str | None) -> dict[str, Any]:
+    if is_financial_dataframe(frame):
+        return {
+            "name": name,
+            "status": "success",
+            "analysis_type": "executive_financial",
+            "result": analyze_financial_dataframe(frame),
+        }
+    gate_response = _design_gate(frame, factor_column, metric_column, None)
+    if gate_response is not None:
+        return {"name": name, "status": "needs_input", **gate_response}
+    engines, factor = _analyze_frame(frame, factor_column, metric_column)
+    return {
+        "name": name,
+        "status": "success",
+        "factor": factor,
+        "analyses": [_analysis_payload(engine) for engine in engines],
+    }
 
 
 def _analyze_frame(
@@ -610,4 +631,144 @@ async def financial_analysis(
             result = await run_in_threadpool(analyze_financial_dataframe, frame)
         return JSONResponse(content=result)
     except (DataParserError, ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/batch-analyze", response_model=None)
+async def batch_analyze(
+    request: Request,
+    files: list[UploadFile] = File(default=[]),
+    items: str | None = Form(default=None),
+    factor_column: str | None = Form(default=None),
+    metric_column: str | None = Form(default=None),
+    _: None = Depends(_verify_integration),
+) -> JSONResponse:
+    """Analyze multiple pasted datasets or uploaded files sequentially."""
+    import json
+
+    try:
+        content_type = request.headers.get("content-type", "").lower()
+        batch_items: list[dict[str, Any]] = []
+        if content_type.startswith("multipart/"):
+            if items:
+                parsed_items = json.loads(items)
+                if not isinstance(parsed_items, list):
+                    raise DataParserError("items must be a JSON array")
+                batch_items.extend(item for item in parsed_items if isinstance(item, dict))
+            for upload in files:
+                batch_items.append({"name": upload.filename or "uploaded file", "file": upload})
+        else:
+            payload = await request.json()
+            batch_items = payload.get("items", payload) if isinstance(payload, dict) else payload
+            if not isinstance(batch_items, list):
+                raise DataParserError("Provide an items array containing raw_text entries")
+
+        if not batch_items:
+            raise DataParserError("Provide at least one pasted dataset or uploaded file")
+        if len(batch_items) > 100:
+            raise DataParserError("A batch may contain at most 100 items")
+
+        results: list[dict[str, Any]] = []
+        async with _analysis_semaphore:
+            for index, item in enumerate(batch_items):
+                name = str(item.get("name") or f"item-{index + 1}")
+                try:
+                    upload = item.get("file")
+                    if upload is not None:
+                        frame = await _load_frame(upload, None)
+                    else:
+                        raw_text = item.get("raw_text") or item.get("text")
+                        if not isinstance(raw_text, str) or not raw_text.strip():
+                            raise DataParserError("Each batch item needs raw_text or a file")
+                        frame = await _load_frame(None, raw_text)
+                    result = await run_in_threadpool(_batch_item_result, frame, name, factor_column, metric_column)
+                except (DataParserError, ValueError, KeyError) as exc:
+                    result = {"name": name, "status": "error", "error": str(exc)}
+                results.append(result)
+        return JSONResponse(content={"ok": True, "batch": True, "count": len(results), "results": results})
+    except (DataParserError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/batch-analyze/download", response_model=None)
+async def batch_download(
+    request: Request,
+    files: list[UploadFile] = File(default=[]),
+    items: str | None = Form(default=None),
+    selected_indices: str | None = Form(default=None),
+    _: None = Depends(_verify_integration),
+) -> StreamingResponse:
+    """Create a ZIP containing one DOCX report for each successful batch item."""
+    import json
+
+    try:
+        content_type = request.headers.get("content-type", "").lower()
+        batch_items: list[dict[str, Any]] = []
+        if content_type.startswith("multipart/"):
+            if items:
+                parsed_items = json.loads(items)
+                if not isinstance(parsed_items, list):
+                    raise DataParserError("items must be a JSON array")
+                batch_items.extend(item for item in parsed_items if isinstance(item, dict))
+            for upload in files:
+                batch_items.append({"name": upload.filename or "uploaded file", "file": upload})
+        else:
+            payload = await request.json()
+            batch_items = payload.get("items", payload) if isinstance(payload, dict) else payload
+            if not isinstance(batch_items, list):
+                raise DataParserError("Provide an items array containing raw_text entries")
+
+        if not batch_items:
+            raise DataParserError("Provide at least one pasted dataset or uploaded file")
+        if len(batch_items) > 100:
+            raise DataParserError("A batch may contain at most 100 items")
+        selected = None
+        if selected_indices:
+            selected = {int(value.strip()) for value in selected_indices.split(",") if value.strip()}
+
+        archive = BytesIO()
+        manifest: list[dict[str, Any]] = []
+        async with _analysis_semaphore:
+            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+                for index, item in enumerate(batch_items):
+                    if selected is not None and index not in selected:
+                        continue
+                    name = str(item.get("name") or f"item-{index + 1}")
+                    try:
+                        upload = item.get("file")
+                        if upload is not None:
+                            frame = await _load_frame(upload, None)
+                        else:
+                            raw_text = item.get("raw_text") or item.get("text")
+                            if not isinstance(raw_text, str) or not raw_text.strip():
+                                raise DataParserError("Each batch item needs raw_text or a file")
+                            frame = await _load_frame(None, raw_text)
+                        if is_financial_dataframe(frame):
+                            engine = await run_in_threadpool(analyze_financial_dataframe, frame)
+                        else:
+                            gate_response = _design_gate(frame, None, None, None)
+                            if gate_response is not None:
+                                manifest.append({"index": index, "name": name, "status": "needs_input", "reason": gate_response.get("reason")})
+                                continue
+                            engines, factor = await run_in_threadpool(_analyze_frame, frame, None, None)
+                            engine = dict(engines[0])
+                            engine["results"] = [item["result"] for item in engines]
+                            engine["result"] = engine["results"][0]
+                            engine["factor"] = factor
+                        report = await run_in_threadpool(generate_docx, engine)
+                        if not isinstance(report, BytesIO):
+                            raise RuntimeError("DOCX generator returned an invalid buffer")
+                        safe_name = "".join(character if character.isalnum() or character in "-_" else "_" for character in name).strip("_") or f"item-{index + 1}"
+                        output.writestr(f"{index + 1:03d}_{safe_name}.docx", report.getvalue())
+                        manifest.append({"index": index, "name": name, "status": "success"})
+                    except (DataParserError, ValueError, KeyError) as exc:
+                        manifest.append({"index": index, "name": name, "status": "error", "reason": str(exc)})
+                output.writestr("manifest.json", json.dumps({"items": manifest}, indent=2))
+        archive.seek(0)
+        return StreamingResponse(
+            archive,
+            media_type="application/zip",
+            headers={"Content-Disposition": 'attachment; filename="rowfirst_batch_reports.zip"'},
+        )
+    except (DataParserError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
