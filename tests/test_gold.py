@@ -299,27 +299,46 @@ def test_labeled_text_and_analysis() -> None:
     assert "Sample-size caveat:" in engine["breakdown"]
 
 
-def test_api_inference_skips_id_columns_and_requires_metric_variance() -> None:
-    from api import _infer_columns
+def test_api_inference_skips_time_and_index_columns_and_requires_measurable_outcomes() -> None:
+    from api import _infer_columns, _numeric_metric_columns
 
     frame = pd.DataFrame({
         "Record_ID": [f"R{index:03d}" for index in range(20)],
         "Teaching_Method": ["A"] * 10 + ["B"] * 10,
-        "Constant_Index": list(range(20)),
+        "Week": list(range(1, 21)),
+        "Month": [1] * 20,
         "Exam_Score": list(range(60, 80)),
     })
-    assert _infer_columns(frame) == ("Teaching_Method", "Constant_Index")
-
-    frame["Constant_Index"] = 1
     assert _infer_columns(frame) == ("Teaching_Method", "Exam_Score")
+    assert _numeric_metric_columns(frame, "Teaching_Method") == ["Exam_Score"]
 
     frame["Exam_Score"] = 1
     try:
         _infer_columns(frame)
     except DataParserError as exc:
-        assert "non-zero variance" in str(exc)
+        assert "No measurable outcome" in str(exc)
     else:
-        raise AssertionError("constant metrics should not be inferred")
+        raise AssertionError("constant or non-measurable outcomes should not be inferred")
+
+
+def test_api_metric_picker_ignores_time_fields_for_finance_batch_analysis() -> None:
+    from api import _numeric_metric_columns
+
+    frame = pd.DataFrame({
+        "Branch": ["A", "A", "B", "B", "A", "A", "B", "B"],
+        "Week": [1, 2, 1, 2, 1, 2, 1, 2],
+        "Month": ["Jan", "Jan", "Feb", "Feb", "Mar", "Mar", "Apr", "Apr"],
+        "Deposits_NGN": [100, 120, 90, 110, 130, 150, 95, 115],
+        "Withdrawal_Count": [10, 12, 9, 11, 13, 15, 10, 12],
+        "NPS": [42, 50, 38, 41, 48, 53, 40, 44],
+        "Error_Tickets": [5, 7, 6, 8, 9, 11, 8, 10],
+    })
+    assert _numeric_metric_columns(frame, "Branch") == [
+        "Deposits_NGN",
+        "Withdrawal_Count",
+        "NPS",
+        "Error_Tickets",
+    ]
 
 
 def test_docx_generation() -> None:

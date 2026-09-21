@@ -35,6 +35,10 @@ IDENTIFIER_COLUMNS = {
     "id", "rowid", "recordid", "uuid", "index", "sampleid", "idnumber",
     "identifier", "rownumber", "recordnumber", "recordcode",
 }
+DISALLOWED_METRIC_TOKENS = (
+    "week", "month", "year", "date", "index", "rowid", "recordid", "id",
+    "uuid", "time", "day", "timestamp",
+)
 MAX_REQUEST_BYTES = int(os.getenv("ROWFIRST_MAX_REQUEST_BYTES", str(50 * 1024 * 1024)))
 MAX_UPLOAD_BYTES = int(os.getenv("ROWFIRST_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 MAX_ROWS = int(os.getenv("ROWFIRST_MAX_ROWS", "100000"))
@@ -271,6 +275,13 @@ def _is_identifier_column(column: Any) -> bool:
     return _column_key(column) in IDENTIFIER_COLUMNS
 
 
+def _is_disallowed_metric_column(column: Any) -> bool:
+    key = _column_key(column)
+    if not key:
+        return False
+    return any(token in key for token in DISALLOWED_METRIC_TOKENS)
+
+
 def _profile_mode(frame: Any, factor_column: str) -> dict[str, Any]:
     if factor_column not in frame.columns:
         raise DataParserError(f"Unknown profile column: {factor_column}")
@@ -374,9 +385,13 @@ def _design_gate(
 
     numeric = [
         str(column) for column in frame.columns
-        if is_numeric_dtype(frame[column]) and not _is_identifier_column(column)
+        if is_numeric_dtype(frame[column])
+        and not _is_identifier_column(column)
+        and not _is_disallowed_metric_column(column)
     ]
-    if metric_column and metric_column.upper() != "ALL" and _is_identifier_column(metric_column):
+    if metric_column and metric_column.upper() != "ALL" and (
+        _is_identifier_column(metric_column) or _is_disallowed_metric_column(metric_column)
+    ):
         return {
             "mode": "refuse",
             "reason": "identifier_column_outcome",
@@ -390,7 +405,7 @@ def _design_gate(
             "reason": "no_numeric_outcome",
             "profile": profile,
             "offers": ["Choose a numeric business measure."],
-            "question": "Which numeric column should be analyzed?",
+            "question": "No measurable outcome. Which column is the metric?",
         }
     return None
 
@@ -433,18 +448,25 @@ def _infer_columns(
             "Could not infer a categorical factor column with fewer than half as many unique values as rows"
         )
 
-    if not metric_column:
-        metric_column = next(
-            (
-                str(column)
-                for column in frame.columns
-                if is_numeric_dtype(frame[column]) and float(frame[column].var()) > 0
-            ),
-            None,
-        )
-    if not metric_column:
-        raise DataParserError("Could not infer a numeric metric column with non-zero variance")
-    return str(factor_column), str(metric_column)
+    if metric_column is not None:
+        if metric_column not in frame.columns:
+            raise DataParserError(f"Unknown metric column: {metric_column}")
+        if _is_disallowed_metric_column(metric_column):
+            raise DataParserError("No measurable outcome. Which column is the metric?")
+        return str(factor_column), str(metric_column)
+
+    candidates = [
+        str(column)
+        for column in frame.columns
+        if str(column) != factor_column
+        and is_numeric_dtype(frame[column])
+        and not _is_identifier_column(column)
+        and not _is_disallowed_metric_column(column)
+        and float(frame[column].var()) > 0
+    ]
+    if not candidates:
+        raise DataParserError("No measurable outcome. Which column is the metric?")
+    return str(factor_column), str(candidates[0])
 
 
 def _infer_factor_column(frame: Any, factor_column: str | None = None) -> str:
@@ -480,6 +502,7 @@ def _numeric_metric_columns(frame: Any, factor_column: str) -> list[str]:
         if str(column) != factor_column
         and is_numeric_dtype(frame[column])
         and not _is_identifier_column(column)
+        and not _is_disallowed_metric_column(column)
     ]
 
 
