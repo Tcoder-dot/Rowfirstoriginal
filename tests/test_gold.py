@@ -370,6 +370,17 @@ def test_backend_auto_infers_generic_non_id_group_and_excludes_plot_patient_as_o
     assert _numeric_metric_columns(frame, "Plot") == ["Revenue"]
 
 
+def test_report_keeps_snake_case_labels_and_removes_forbidden_anova_phrase() -> None:
+    from analysis_service import _discussion_limits, _humanize_label
+
+    assert _humanize_label("hb_g_dl") == "hb_g_dl"
+    text = _discussion_limits([
+        {"test": "one-way anova", "groups": [{"name": "A", "n": 4}, {"name": "B", "n": 4}]}
+    ])
+    assert "ANOVA does not establish that every pair of groups differs" not in text
+    assert "Post-hoc testing" in text
+
+
 def test_docx_generation() -> None:
     frame = pd.DataFrame({"Treatment": ["A", "A", "B", "B"], "Value": [1, 2, 4, 5]})
     engine = analyze_dataframe(frame, "Treatment", "Value")

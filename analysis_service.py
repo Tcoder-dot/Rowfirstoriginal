@@ -332,7 +332,6 @@ def write_docx(engine: dict[str, Any], path: str | Path | BytesIO) -> str | Byte
     results = _results(engine)
     document = Document()
     document.add_heading(_clean_document_text(TITLE), level=1)
-    document.add_paragraph("Compiled by Rowfirst Engine — 100% Deterministic SciPy Execution (Zero LLM Calculation Drift)")
     document.add_paragraph("Statistical analysis and working built from the verified engine JSON.")
     document.add_heading("1 Study and design", level=2)
     for paragraph in _preamble(engine, results):
@@ -398,7 +397,6 @@ def write_pdf(engine: dict[str, Any], path: str | Path) -> str:
     styles.add(ParagraphStyle(name="RowfirstSmall", parent=styles["BodyText"], alignment=TA_LEFT, fontSize=8, leading=10))
     story = [
         Paragraph(_escape(_clean_document_text(TITLE)), styles["Title"]),
-        Paragraph("Compiled by Rowfirst Engine — 100% Deterministic SciPy Execution (Zero LLM Calculation Drift)", styles["RowfirstBody"]),
         PageBreak(),
         Paragraph("1 Study and design", styles["Heading2"]),
     ]
@@ -452,6 +450,8 @@ def _humanize_label(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
         return "Outcome"
+    if "_" in text and not any(ch.isspace() for ch in text):
+        return text
     lowered = text.lower()
 
     if re.search(r"(?i)\btotal\s+viable\s+count\b.*\b(?:log|ln)\b.*\bcfu\b", lowered):
@@ -504,7 +504,13 @@ def _preamble(engine: dict[str, Any], results: list[dict[str, Any]]) -> list[str
         factor_name = str(result.get("factor") or result.get("groupingVariable") or "Treatment")
         outcome_name = _humanize_label(_outcome_name(result))
         factor_label = _humanize_label(factor_name)
-        lines.append(f"A one-way analysis of variance (ANOVA) was conducted to evaluate the effect of {factor_label} on {outcome_name}.")
+        test = result.get("test")
+        if test in {"student-t", "welch-t"}:
+            lines.append(f"An independent-samples t-test was conducted to evaluate the effect of {factor_label} on {outcome_name}.")
+        elif test == "one-way anova":
+            lines.append(f"A one-way ANOVA was conducted to evaluate the effect of {factor_label} on {outcome_name}.")
+        else:
+            lines.append(f"A statistical comparison was conducted to evaluate the effect of {factor_label} on {outcome_name}.")
         break
     lines.extend([
         f"The analysis used a {_design(results)} design.",
@@ -565,9 +571,9 @@ def _design(results: list[dict[str, Any]]) -> str:
     labels = []
     for result in results:
         label = {
-            "student-t": "independent-samples comparison",
-            "welch-t": "independent-samples comparison",
-            "paired-t": "paired comparison",
+            "student-t": "independent t-test",
+            "welch-t": "independent t-test",
+            "paired-t": "paired t-test",
             "one-way anova": "one-way ANOVA",
             "two-way anova": "two-way ANOVA",
             "simple linear regression": "simple linear regression",
@@ -1113,7 +1119,7 @@ def _discussion_limits(results: list[dict[str, Any]]) -> str:
     if _has_small_group_sample(results):
         clauses.append("Small n limits how widely this pattern can be generalized")
     if any(result.get("test") in {"one-way anova", "two-way anova"} for result in results):
-        clauses.append("ANOVA does not establish that every pair of groups differs")
+        clauses.append("Post-hoc testing, when run, identifies which group pairs differ")
     clauses.append("No causation is established")
     clauses.append(_discussion_outcome_limit(results))
     return "Limits: " + ". ".join(clauses) + "."
