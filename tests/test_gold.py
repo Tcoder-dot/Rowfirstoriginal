@@ -146,6 +146,39 @@ def test_financial_engine_accepts_currency_suffixed_headers() -> None:
     assert abs(result["kpis"]["mean_monthly_expenses"] - 12166.666666666666) < 1e-9
 
 
+def test_financial_docx_includes_chart_images() -> None:
+    frame = pd.DataFrame({
+        "Month": ["2026-01", "2026-02", "2026-03"],
+        "Revenue": [100000, 110000, 120000],
+        "Operating Expenses": [35000, 40000, 45000],
+        "Cash Reserves": [200000, 180000, 150000],
+    })
+    engine = analyze_financial_dataframe(frame)
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "financial-results.docx"
+        generate_docx(engine, path)
+        with zipfile.ZipFile(path) as archive:
+            media = [name for name in archive.namelist() if name.startswith("word/media/")]
+            assert media
+            chart_payloads = [archive.read(name) for name in media]
+            assert any(payload.startswith(b"\x89PNG\r\n\x1a\n") for payload in chart_payloads)
+
+
+def test_financial_summary_uses_totals_and_missing_cash_sets_na_runway() -> None:
+    frame = pd.DataFrame({
+        "Month": ["2026-01", "2026-02", "2026-03"],
+        "Revenue": [100, 200, 300],
+        "Operating Expenses": [40, 50, 60],
+        "Payroll": [10, 10, 10],
+    })
+    result = analyze_financial_dataframe(frame)
+    assert result["template_context"]["total_net_revenue"] == 600.0
+    assert result["kpis"]["total_net_revenue"] == 600.0
+    assert result["kpis"]["cumulative_ebitda"] == 600.0 - (40 + 50 + 60)
+    assert result["kpis"]["runway_months"] == "N/A"
+    assert not any(warning.get("type") == "cash_runway_warning" for warning in result["diagnostics"]["warnings"])
+
+
 def test_financial_api_accepts_json_rows() -> None:
     os.environ["ROWFIRST_ID"] = "demo-id"
     os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"

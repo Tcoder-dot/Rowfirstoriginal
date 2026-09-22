@@ -317,12 +317,15 @@ def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
     monthly["mom_growth_rate"] = monthly["revenue"].pct_change() * 100
 
     total_net_revenue = float(monthly["revenue"].sum())
+    cumulative_ebitda = float(monthly["ebitda"].sum()) if "ebitda" in monthly else float(monthly["revenue"].sum() - monthly["total_expenses"].sum())
     avg_monthly_burn = float(monthly["total_expenses"].mean())
     avg_mom_growth = float(monthly["mom_growth_rate"].dropna().mean()) if monthly["mom_growth_rate"].notna().any() else 0.0
     total_expense_mean = float(monthly["total_expenses"].mean())
     legacy_expense_mean = float(monthly["operating_expenses"].mean()) if "operating_expenses" in monthly else total_expense_mean
     current_cash = float(monthly["cash_reserves"].dropna().iloc[-1]) if "cash_reserves" in monthly and monthly["cash_reserves"].notna().any() else None
-    runway = current_cash / total_expense_mean if current_cash is not None and total_expense_mean > 0 else None
+    runway = None if current_cash is None else (current_cash / total_expense_mean if total_expense_mean > 0 else None)
+    if current_cash is None:
+        runway = "N/A"
     revenue_regression = _regression(monthly["revenue"])
     growth_values = monthly["mom_growth_rate"].replace([np.inf, -np.inf], np.nan).dropna()
     growth_regression = _regression(growth_values)
@@ -351,17 +354,25 @@ def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
     latest_growth = float(latest["mom_growth_rate"]) if pd.notna(latest["mom_growth_rate"]) else 0.0
     latest_margin = float(latest["operating_margin"]) if pd.notna(latest["operating_margin"]) else 0.0
     latest_ebitda = float(latest["ebitda"])
-    narrative = (
-        f"Financial Performance Summary: Net Revenue: {_money(float(latest['revenue']))} "
-        f"(Representing a {latest_growth:.2f}% MoM growth rate via linear trend analysis). "
-        f"Operating Margin: {latest_margin:.2f}% (EBITDA: {_money(latest_ebitda)}). "
-        f"Capital Efficiency: Current cash burn yields a Runway of {runway:.2f} months based on deterministic mean expense calculations."
-        if runway is not None else
-        f"Financial Performance Summary: Net Revenue: {_money(float(latest['revenue']))} "
-        f"(Representing a {latest_growth:.2f}% MoM growth rate via linear trend analysis). "
-        f"Operating Margin: {latest_margin:.2f}% (EBITDA: {_money(latest_ebitda)}). "
-        "Capital Efficiency: Current cash burn yields an undetermined Runway because mean expenses are zero or cash reserves are unavailable."
-    )
+    if runway == "N/A":
+        narrative = (
+            f"Financial Performance Summary: Net Revenue: {_money(float(latest['revenue']))} "
+            f"(Representing a {latest_growth:.2f}% MoM growth rate via linear trend analysis). "
+            f"Operating Margin: {latest_margin:.2f}% (EBITDA: {_money(latest_ebitda)}). "
+            "Capital Efficiency: Cash reserves are unavailable, so runway is undetermined."
+        )
+    else:
+        narrative = (
+            f"Financial Performance Summary: Net Revenue: {_money(float(latest['revenue']))} "
+            f"(Representing a {latest_growth:.2f}% MoM growth rate via linear trend analysis). "
+            f"Operating Margin: {latest_margin:.2f}% (EBITDA: {_money(latest_ebitda)}). "
+            f"Capital Efficiency: Current cash burn yields a Runway of {runway:.2f} months based on deterministic mean expense calculations."
+            if runway is not None else
+            f"Financial Performance Summary: Net Revenue: {_money(float(latest['revenue']))} "
+            f"(Representing a {latest_growth:.2f}% MoM growth rate via linear trend analysis). "
+            f"Operating Margin: {latest_margin:.2f}% (EBITDA: {_money(latest_ebitda)}). "
+            "Capital Efficiency: Current cash burn yields an undetermined Runway because mean expenses are zero or cash reserves are unavailable."
+        )
     records = monthly.replace({np.nan: None}).to_dict(orient="records")
     return {
         "ok": True,
@@ -370,6 +381,7 @@ def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
         "kpis": {
             "net_revenue": float(latest["revenue"]),
             "total_period_revenue": total_net_revenue,
+            "total_net_revenue": total_net_revenue,
             "mean_monthly_revenue": float(monthly["revenue"].mean()),
             "period_over_period_growth_rate": latest_growth,
             "mom_growth_rate": latest_growth,
@@ -379,6 +391,7 @@ def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
             "gross_profit_margin": float(latest["gross_margin"]) if pd.notna(latest["gross_margin"]) else None,
             "net_profit_margin": float(latest["net_margin"]) if pd.notna(latest["net_margin"]) else None,
             "ebitda": latest_ebitda,
+            "cumulative_ebitda": cumulative_ebitda,
             "operating_margin": latest_margin,
             "mean_monthly_expenses": legacy_expense_mean,
             "mean_total_operating_expenses": total_expense_mean,
@@ -389,6 +402,7 @@ def analyze_financial_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
         },
         "template_context": {
             "total_net_revenue": total_net_revenue,
+            "cumulative_ebitda": cumulative_ebitda,
             "avg_monthly_burn": avg_monthly_burn,
             "avg_mom_growth": avg_mom_growth,
         },
