@@ -4,6 +4,8 @@ from __future__ import annotations
 import csv
 from io import BytesIO, StringIO
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.request import urlopen
 
 import pandas as pd
 
@@ -117,6 +119,73 @@ def parse_uploaded_file(buffer: bytes | bytearray | BytesIO, filename: str) -> p
     if suffix in {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}:
         return parse_image(buffer)
     raise DataParserError("Supported uploads are CSV, XLSX, XLS, PDF, DOCX, PNG, JPG, WEBP, TIFF, or BMP")
+
+
+def parse_spreadsheet_source(source: str) -> pd.DataFrame:
+    """Load a spreadsheet from a Google Sheets URL or a remote spreadsheet file URL."""
+    text = str(source or "").strip()
+    if not text:
+        raise DataParserError("Spreadsheet source is empty")
+    parsed = urlparse(text)
+    if parsed.scheme in {"http", "https"}:
+        path = parsed.path.lower()
+        suffix = Path(parsed.path).suffix.lower()
+        is_google_sheet = (
+            "docs.google.com" in parsed.netloc.lower() and "/spreadsheets/" in path
+        ) or "spreadsheets.google.com" in parsed.netloc.lower()
+        if is_google_sheet:
+            export_url = _google_sheet_export_url(text)
+            payload = _download_url_bytes(export_url)
+            return _parse_remote_spreadsheet_payload(payload, "google_sheet.csv", source_hint="google_sheets")
+        if suffix in {".csv", ".xlsx", ".xls"}:
+            payload = _download_url_bytes(text)
+            filename = Path(parsed.path).name or "remote_spreadsheet"
+            return parse_uploaded_file(payload, filename)
+        if "format=csv" in text.lower() or "export?format=" in text.lower() or text.lower().endswith("csv"):
+            payload = _download_url_bytes(text)
+            return _parse_remote_spreadsheet_payload(payload, Path(parsed.path).name or "remote_data.csv", source_hint="csv_export")
+        if "format=xlsx" in text.lower() or "format=xls" in text.lower():
+            payload = _download_url_bytes(text)
+            filename = Path(parsed.path).name or "remote_spreadsheet.xlsx"
+            return parse_uploaded_file(payload, filename)
+    raise DataParserError("Only Google Sheets URLs and remote CSV/XLSX/XLS spreadsheet URLs are supported")
+
+
+def _parse_remote_spreadsheet_payload(payload: bytes, filename: str, source_hint: str = "remote") -> pd.DataFrame:
+    """Parse remote spreadsheet payloads safely, falling back from CSV to Excel when needed."""
+    try:
+        return parse_csv_buffer(payload, filename=filename)
+    except DataParserError as exc:
+        if payload.startswith(b"PK"):
+            try:
+                return parse_excel_buffer(payload, filename=filename if filename.lower().endswith((".xlsx", ".xls")) else "remote_spreadsheet.xlsx")
+            except DataParserError:
+                raise exc from exc
+        raise exc from exc
+
+
+def _google_sheet_export_url(sheet_url: str) -> str:
+    url = urlparse(sheet_url)
+    host = url.netloc.lower()
+    path = url.path.lower()
+    if "docs.google.com" not in host and "spreadsheets.google.com" not in host:
+        raise DataParserError("Not a valid Google Sheets URL")
+    if "/d/" not in path and "/spreadsheets/d/" not in path:
+        raise DataParserError("Google Sheets URL must include a spreadsheet id")
+    spreadsheet_id = path.split("/d/", 1)[1].split("/", 1)[0]
+    query = parse_qs(url.query)
+    requested_format = (query.get("format") or [None])[0]
+    if requested_format in {"xlsx", "xls"}:
+        return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?{urlencode({'format': requested_format})}"
+    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export"
+
+
+def _download_url_bytes(url: str) -> bytes:
+    try:
+        with urlopen(url, timeout=30) as response:
+            return response.read()
+    except Exception as exc:  # pragma: no cover - runtime guard
+        raise DataParserError(f"Could not download spreadsheet source: {exc}") from exc
 
 
 def parse_tabular_text(text: str) -> pd.DataFrame:
