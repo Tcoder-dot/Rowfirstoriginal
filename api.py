@@ -21,7 +21,7 @@ from starlette.concurrency import run_in_threadpool
 
 from analysis_service import analyze_dataframe, generate_docx
 from charts import make_chart_base64
-from data_parser import DataParserError, parse_tabular_text, parse_uploaded_file
+from data_parser import DataParserError, parse_spreadsheet_source, parse_tabular_text, parse_uploaded_file
 from financial_engine import (
     analyze_financial_dataframe,
     financial_schema_profile,
@@ -201,14 +201,34 @@ async def _load_frame(
     elif raw_text:
         if len(raw_text.encode("utf-8")) > MAX_UPLOAD_BYTES:
             raise DataParserError("Pasted data exceeds the configured size limit")
-        frame = parse_tabular_text(raw_text)
+        if _is_spreadsheet_source(raw_text):
+            frame = parse_spreadsheet_source(raw_text)
+        else:
+            frame = parse_tabular_text(raw_text)
     else:
-        raise DataParserError("Provide a CSV file or raw_text")
+        raise DataParserError("Provide a CSV file, raw_text, or spreadsheet source URL")
     if len(frame) > MAX_ROWS:
         raise DataParserError(f"Input contains {len(frame)} rows; maximum is {MAX_ROWS}")
     if len(frame.columns) > MAX_COLUMNS:
         raise DataParserError(f"Input contains {len(frame.columns)} columns; maximum is {MAX_COLUMNS}")
     return frame
+
+
+def _is_spreadsheet_source(value: str) -> bool:
+    text = (value or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    return (
+        lowered.startswith("http://")
+        or lowered.startswith("https://")
+    ) and (
+        "docs.google.com/spreadsheets" in lowered
+        or "spreadsheets.google.com" in lowered
+        or lowered.endswith(".csv")
+        or lowered.endswith(".xlsx")
+        or lowered.endswith(".xls")
+    )
 
 
 async def _analyze_request(
@@ -558,6 +578,33 @@ def _analysis_payload(engine: dict[str, Any]) -> dict[str, Any]:
 
 def _public_engine(engine: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in engine.items() if key != "source_frame"}
+
+
+@app.post("/api/v1/connectors/spreadsheet", response_model=None)
+async def spreadsheet_connector(
+    request: Request,
+    file: UploadFile | None = File(default=None),
+    source_url: str | None = Form(default=None),
+    source_type: str | None = Form(default=None),
+    _: None = Depends(_verify_integration),
+) -> JSONResponse:
+    """Fetch spreadsheet data from a public URL or uploaded workbook and normalize it through the standard engine pipeline."""
+    try:
+        if file is not None:
+            frame = await _load_frame(file, None)
+        elif source_url:
+            frame = await run_in_threadpool(parse_spreadsheet_source, source_url)
+        else:
+            raise DataParserError("Provide a spreadsheet file upload or a Google Sheets / Excel source URL")
+        return JSONResponse(content={
+            "ok": True,
+            "source_type": source_type or ("google_sheets" if "docs.google.com/spreadsheets" in (source_url or "").lower() else "spreadsheet"),
+            "columns": list(frame.columns),
+            "rows": frame.to_dict(orient="records"),
+            "row_count": len(frame),
+        })
+    except (DataParserError, ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/analyze", response_model=None)

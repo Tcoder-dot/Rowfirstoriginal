@@ -108,6 +108,36 @@ def test_parser_delimiters() -> None:
     assert parse_tabular_text("Group Score\nA 1").shape == (1, 2)
 
 
+def test_spreadsheet_source_parser_supports_google_sheet_and_excel_urls(monkeypatch) -> None:
+    from data_parser import parse_spreadsheet_source
+
+    class DummyResponse(BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.close()
+
+    def fake_urlopen(url, timeout=30):
+        if url.endswith("export") or ".csv" in url:
+            payload = b"Month,Revenue\n2026-01,100\n2026-02,110\n"
+            return DummyResponse(payload)
+        excel_buffer = BytesIO()
+        pd.DataFrame({"Month": ["2026-01", "2026-02"], "Revenue": [200, 220]}).to_excel(excel_buffer, index=False)
+        excel_buffer.seek(0)
+        return DummyResponse(excel_buffer.getvalue())
+
+    monkeypatch.setattr("data_parser.urlopen", fake_urlopen)
+
+    google_frame = parse_spreadsheet_source("https://docs.google.com/spreadsheets/d/test-sheet/export?format=csv&gid=0")
+    assert list(google_frame.columns) == ["Month", "Revenue"]
+    assert google_frame.iloc[0]["Revenue"] == 100
+
+    excel_frame = parse_spreadsheet_source("https://example.com/ledger.xlsx")
+    assert list(excel_frame.columns) == ["Month", "Revenue"]
+    assert excel_frame.iloc[1]["Revenue"] == 220
+
+
 def test_financial_engine_returns_kpis_diagnostics_narrative_and_chart() -> None:
     frame = pd.DataFrame({
         "Month": ["2026-01", "2026-02", "2026-04"],
