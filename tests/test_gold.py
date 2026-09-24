@@ -844,6 +844,72 @@ def test_api_chat_uses_groq_with_history_and_dataset_summary(monkeypatch) -> Non
     assert captured["messages"][-1]["content"] == "What is EBITDA?"
 
 
+def test_supabase_auth_route_accepts_backend_jwt(monkeypatch) -> None:
+    class FakeAuth:
+        @staticmethod
+        def get_user(token: str):
+            assert token == "demo-jwt"
+            return type("Response", (), {"user": {"id": "user-123", "email": "hello@example.com"}})()
+
+    class FakeClient:
+        auth = FakeAuth
+
+    monkeypatch.setattr("api._supabase_client", lambda: FakeClient())
+    response = TestClient(app).get(
+        "/api/v1/auth/me",
+        headers={"Authorization": "Bearer demo-jwt"},
+    )
+    assert response.status_code == 200
+    assert response.json()["user"]["id"] == "user-123"
+
+
+def test_supabase_profile_route_upserts_profile(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeTable:
+        def __init__(self):
+            self.payload = None
+
+        def select(self, *args, **kwargs):
+            return self
+
+        def eq(self, *args, **kwargs):
+            return self
+
+        def maybe_single(self):
+            return type("Response", (), {"data": {"id": "user-123", "email": "hello@example.com"}})()
+
+        def upsert(self, payload):
+            captured["payload"] = payload
+            self.payload = payload
+            return self
+
+        def execute(self):
+            return type("Response", (), {"data": self.payload})()
+
+    class FakeAuth:
+        @staticmethod
+        def get_user(token: str):
+            assert token == "demo-jwt"
+            return type("Response", (), {"user": {"id": "user-123", "email": "hello@example.com"}})()
+
+    class FakeClient:
+        auth = FakeAuth
+        def table(self, table_name: str):
+            assert table_name == "profiles"
+            return FakeTable()
+
+    monkeypatch.setattr("api._supabase_client", lambda: FakeClient())
+    response = TestClient(app).post(
+        "/api/v1/profile",
+        json={"full_name": "Demo User"},
+        headers={"Authorization": "Bearer demo-jwt"},
+    )
+    assert response.status_code == 200
+    assert response.json()["profile"]["id"] == "user-123"
+    assert captured["payload"]["full_name"] == "Demo User"
+
+
 def test_public_api_supports_explicit_advanced_models_and_docx() -> None:
     os.environ["ROWFIRST_ID"] = "demo-id"
     os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"

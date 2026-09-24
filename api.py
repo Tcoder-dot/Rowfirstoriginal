@@ -552,6 +552,121 @@ def _public_engine(engine: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in engine.items() if key != "source_frame"}
 
 
+def _supabase_config() -> dict[str, str]:
+    return {
+        "url": (os.getenv("SUPABASE_URL") or "").strip(),
+        "service_role_key": (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE") or "").strip(),
+        "anon_key": (os.getenv("SUPABASE_ANON_KEY") or "").strip(),
+    }
+
+
+def _supabase_client() -> Any:
+    settings = _supabase_config()
+    if not settings["url"] or not settings["service_role_key"]:
+        raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured in the backend environment")
+    try:
+        from supabase import create_client
+    except ImportError as exc:  # pragma: no cover - dependency is installed via requirements
+        raise RuntimeError("The Supabase Python SDK is not installed") from exc
+    return create_client(settings["url"], settings["service_role_key"])
+
+
+def _get_bearer_token(request: Request) -> str | None:
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, value = authorization.partition(" ")
+    if scheme.lower() == "bearer" and value.strip():
+        return value.strip()
+    return None
+
+
+async def _require_supabase_user(request: Request) -> dict[str, Any]:
+    token = _get_bearer_token(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="Authorization header with Bearer token is required")
+
+    try:
+        client = _supabase_client()
+        auth_response = client.auth.get_user(token)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - actual auth failures are validated by Supabase
+        raise HTTPException(status_code=401, detail="Invalid or expired Supabase session") from exc
+
+    user = getattr(auth_response, "user", None)
+    if user is None and isinstance(auth_response, dict):
+        user = auth_response.get("user")
+    if not isinstance(user, dict) or not user.get("id"):
+        raise HTTPException(status_code=401, detail="Supabase user is missing or invalid")
+
+    request.state.supabase_user = user
+    return user
+
+
+async def _read_supabase_profile(user: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        client = _supabase_client()
+        result = client.table("profiles").select("*").eq("id", user["id"]).maybe_single().execute()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception:
+        return None
+    data = getattr(result, "data", None)
+    if isinstance(data, dict) and data.get("id"):
+        return data
+    return None
+
+
+async def _upsert_supabase_profile(user: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    record = {
+        "id": user["id"],
+        "email": payload.get("email") or user.get("email") or "",
+        "full_name": payload.get("full_name") or user.get("user_metadata", {}).get("full_name") or user.get("email") or "",
+        "avatar_url": payload.get("avatar_url") or user.get("user_metadata", {}).get("avatar_url"),
+        "role": payload.get("role") or "user",
+        "is_active": payload.get("is_active", True),
+    }
+    try:
+        client = _supabase_client()
+        result = client.table("profiles").upsert(record).execute()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Unable to persist the Supabase profile") from exc
+    data = getattr(result, "data", None)
+    if isinstance(data, list) and data:
+        return data[0]
+    if isinstance(data, dict):
+        return data
+    profile = await _read_supabase_profile(user)
+    if profile:
+        return profile
+    return record
+
+
+def _supabase_database_status(user: dict[str, Any]) -> dict[str, Any]:
+    settings = _supabase_config()
+    if not settings["url"] or not settings["service_role_key"]:
+        return {"configured": False, "status": "missing_env", "table": "profiles"}
+
+    try:
+        client = _supabase_client()
+        result = client.table("profiles").select("id,email").eq("id", user.get("id")).limit(1).execute()
+        rows = getattr(result, "data", []) or []
+        return {
+            "configured": True,
+            "status": "ready" if rows or "no_rows" else "ready",
+            "table": "profiles",
+            "profile": rows[0] if rows else None,
+        }
+    except Exception:
+        return {
+            "configured": True,
+            "status": "schema_not_created",
+            "table": "profiles",
+            "message": "Supabase project is configured, but the profiles table has not been created yet.",
+        }
+
+
 def _normalize_dataset_summary(dataset_summary: Any) -> str:
     if dataset_summary is None:
         return "No dataset summary was provided."
@@ -630,6 +745,34 @@ async def chat(request: Request) -> JSONResponse:
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return JSONResponse(content={"reply": reply, "model": model})
+
+
+@app.get("/api/v1/auth/me", response_model=None)
+async def supabase_me(request: Request, user: dict[str, Any] = Depends(_require_supabase_user)) -> JSONResponse:
+    """Return the authenticated Supabase user record and the current database readiness for backend-only auth flows."""
+    return JSONResponse(content={"user": user, "database": _supabase_database_status(user)})
+
+
+@app.get("/api/v1/profile", response_model=None)
+async def get_supabase_profile(request: Request, user: dict[str, Any] = Depends(_require_supabase_user)) -> JSONResponse:
+    """Return the current user profile stored in the backend database."""
+    profile = await _read_supabase_profile(user)
+    if profile is None:
+        profile = await _upsert_supabase_profile(user, {})
+    return JSONResponse(content={"profile": profile})
+
+
+@app.post("/api/v1/profile", response_model=None)
+async def upsert_supabase_profile(request: Request, user: dict[str, Any] = Depends(_require_supabase_user)) -> JSONResponse:
+    """Create or update the current authenticated profile in the backend database."""
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+    profile = await _upsert_supabase_profile(user, payload)
+    return JSONResponse(content={"profile": profile})
 
 
 @app.post("/api/v1/connectors/spreadsheet", response_model=None)
