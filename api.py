@@ -552,6 +552,86 @@ def _public_engine(engine: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in engine.items() if key != "source_frame"}
 
 
+def _normalize_dataset_summary(dataset_summary: Any) -> str:
+    if dataset_summary is None:
+        return "No dataset summary was provided."
+    if isinstance(dataset_summary, str):
+        text = dataset_summary.strip()
+        return text if text else "No dataset summary was provided."
+    if isinstance(dataset_summary, dict):
+        return json.dumps(dataset_summary, sort_keys=True, ensure_ascii=False)
+    return str(dataset_summary)
+
+
+def _chat_system_prompt(dataset_summary: Any) -> str:
+    summary = _normalize_dataset_summary(dataset_summary)
+    return (
+        "You are Rowfirst AI Co-Pilot, an approachable, highly precise financial analyst. "
+        "Use the provided dataset summary as the single source of truth and answer with verified numbers only. "
+        "When metrics are missing, say so instead of guessing. Explain anomalies, trends, and financial breakdowns using clear bullet points and bold headers. "
+        f"Dataset summary: {summary}"
+    )
+
+
+def _call_groq_chat(model: str, messages: list[dict[str, str]], *, temperature: float = 0.2, max_tokens: int | None = None) -> str:
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is not configured")
+    try:
+        from groq import Groq
+    except ImportError as exc:  # pragma: no cover - dependency is optional until installed
+        raise RuntimeError("The Groq SDK is not installed") from exc
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    content = response.choices[0].message.content
+    if isinstance(content, list):
+        return "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+    return str(content or "")
+
+
+@app.post("/api/chat", response_model=None)
+async def chat(request: Request) -> JSONResponse:
+    """Return a Groq-backed conversational answer grounded in the dataset summary."""
+    try:
+        payload = await request.json()
+    except Exception as exc:  # pragma: no cover - exercised via bad payloads
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    raw_messages = payload.get("messages")
+    if not isinstance(raw_messages, list) or not raw_messages:
+        raise HTTPException(status_code=400, detail="messages must be a non-empty list of role/content objects")
+
+    cleaned_messages: list[dict[str, str]] = []
+    for item in raw_messages:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "user").strip() or "user"
+        if role not in {"system", "user", "assistant"}:
+            role = "user"
+        content = item.get("content")
+        cleaned_messages.append({"role": role, "content": str(content or "")})
+
+    if not cleaned_messages:
+        raise HTTPException(status_code=400, detail="messages must include at least one valid message")
+
+    system_prompt = _chat_system_prompt(payload.get("dataset_summary"))
+    chat_messages = [{"role": "system", "content": system_prompt}, *cleaned_messages]
+    model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    try:
+        reply = await run_in_threadpool(_call_groq_chat, model, chat_messages, temperature=0.2, max_tokens=1024)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return JSONResponse(content={"reply": reply, "model": model})
+
+
 @app.post("/api/v1/connectors/spreadsheet", response_model=None)
 async def spreadsheet_connector(
     request: Request,

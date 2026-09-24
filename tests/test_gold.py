@@ -815,6 +815,35 @@ def test_public_api_infers_columns_when_not_supplied() -> None:
     assert response.json()["metric"] == "Value"
 
 
+def test_api_chat_uses_groq_with_history_and_dataset_summary(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_call_groq(model: str, messages: list[dict[str, str]], *, temperature: float, max_tokens: int | None = None):
+        captured["model"] = model
+        captured["messages"] = messages
+        captured["temperature"] = temperature
+        captured["max_tokens"] = max_tokens
+        return "EBITDA is $250k based on the verified dataset summary."
+
+    monkeypatch.setattr("api._call_groq_chat", fake_call_groq)
+    response = TestClient(app).post(
+        "/api/chat",
+        json={
+            "messages": [
+                {"role": "user", "content": "What is EBITDA?"},
+            ],
+            "dataset_summary": "Revenue: $1.2M | EBITDA: $250k | Runway: 8 months | Columns: month, revenue, opex",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["reply"] == "EBITDA is $250k based on the verified dataset summary."
+    assert captured["model"] == "llama-3.3-70b-versatile"
+    assert captured["messages"][0]["role"] == "system"
+    assert "Rowfirst AI Co-Pilot" in captured["messages"][0]["content"]
+    assert "Revenue: $1.2M | EBITDA: $250k" in captured["messages"][0]["content"]
+    assert captured["messages"][-1]["content"] == "What is EBITDA?"
+
+
 def test_public_api_supports_explicit_advanced_models_and_docx() -> None:
     os.environ["ROWFIRST_ID"] = "demo-id"
     os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"

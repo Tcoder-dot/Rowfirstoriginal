@@ -17,3 +17,5 @@ rapidfuzz
 fastapi
 python-multipart
 uvicorn
+groq
+mistralai
