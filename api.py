@@ -197,7 +197,7 @@ async def _load_frame(
         payload = await file.read(MAX_UPLOAD_BYTES + 1)
         if len(payload) > MAX_UPLOAD_BYTES:
             raise DataParserError("Uploaded file exceeds the configured size limit")
-        frame = parse_uploaded_file(payload, file.filename or "")
+        frame = parse_uploaded_file(payload, file.filename or "", content_type=file.content_type)
     elif raw_text:
         if len(raw_text.encode("utf-8")) > MAX_UPLOAD_BYTES:
             raise DataParserError("Pasted data exceeds the configured size limit")

@@ -638,6 +638,22 @@ def test_image_upload_uses_ocr(monkeypatch) -> None:
     assert list(parse_image(image_buffer.getvalue()).columns) == ["Treatment", "Value"]
 
 
+def test_mime_detection_and_mistral_table_extraction(monkeypatch) -> None:
+    from data_parser import detect_upload_kind, extract_mistral_table_frame
+
+    assert detect_upload_kind("report.pdf", "application/pdf") == "pdf"
+    assert detect_upload_kind("image.jpg", "image/jpeg") == "image"
+    assert detect_upload_kind("data.csv", "text/csv") == "csv"
+
+    extracted = {
+        "markdown": "| Treatment | Value |\n| --- | --- |\n| A | 1 |\n| B | 2 |",
+    }
+    monkeypatch.setattr("data_parser._mistral_ocr_extract", lambda *args, **kwargs: extracted)
+    frame = extract_mistral_table_frame(extracted)
+    assert list(frame.columns) == ["Treatment", "Value"]
+    assert frame.iloc[0].to_dict() == {"Treatment": "A", "Value": "1"}
+
+
 def test_bad_table_is_rejected() -> None:
     try:
         parse_tabular_text("single-value")
