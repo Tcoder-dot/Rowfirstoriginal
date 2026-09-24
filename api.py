@@ -266,7 +266,11 @@ def _analyze_frame(
     factor_column: str | None,
     metric_column: str | None,
 ) -> tuple[list[dict[str, Any]], str]:
-    factor_column = _infer_factor_column(frame, factor_column)
+    if factor_column is None:
+        factor_column = _infer_factor_column(frame)
+    if factor_column not in frame.columns:
+        frame = frame.copy()
+        frame[factor_column] = [f"row_{index + 1}" for index in range(len(frame))]
     metric_columns = (
         [str(metric_column)]
         if metric_column and metric_column.upper() != "ALL"
@@ -383,62 +387,10 @@ def _design_gate(
             ],
             "question": "This looks like financial data, but the ledger schema is incomplete. Which columns represent period, revenue, and operating expenses?",
         }
-    if factor_column and _is_identifier_column(factor_column):
-        return {
-            "mode": "refuse",
-            "reason": "identifier_column",
-            "profile": profile,
-            "offers": ["Choose a real categorical group, such as Treatment, Department, or Segment."],
-            "question": "Which column represents the repeated business group?",
-        }
-
-    candidate_factor = factor_column
-    if not candidate_factor:
-        try:
-            candidate_factor = _infer_factor_column(frame)
-        except DataParserError:
-            candidate_factor = None
-    if not candidate_factor:
-        return {
-            "mode": "ask",
-            "reason": "no_obvious_group_column",
-            "profile": profile,
-            "offers": ["Select a grouping column", "Run profile mode for column counts"],
-            "question": "Which column should define the groups, departments, segments, or treatments?",
-        }
-    if candidate_factor not in frame.columns:
-        raise DataParserError(f"Unknown factor column: {candidate_factor}")
-    if not (is_object_dtype(frame[candidate_factor]) or is_string_dtype(frame[candidate_factor])):
-        return {
-            "mode": "refuse",
-            "reason": "factor_not_categorical",
-            "profile": profile,
-            "offers": ["Choose a categorical text column as the group."],
-            "question": "Which text column represents the groups?",
-        }
-
-    counts = frame[candidate_factor].dropna().value_counts()
-    if len(counts) < 2:
-        return {
-            "mode": "refuse",
-            "reason": "one_group_only",
-            "profile": profile,
-            "offers": ["Provide at least two repeated groups."],
-            "question": "Which column contains at least two business groups?",
-        }
-    if len(counts) >= len(frame) * 0.9 or counts.min() < 2:
-        return {
-            "mode": "refuse",
-            "reason": "unique_or_singleton_groups",
-            "profile": profile,
-            "offers": ["Choose a real grouping column, not a row number, ID, company name, or URL."],
-            "question": "Which column contains repeated groups suitable for comparison?",
-        }
 
     numeric = [
         str(column) for column in frame.columns
         if is_numeric_dtype(frame[column])
-        and not _is_identifier_column(column)
         and not _is_disallowed_metric_column(column)
     ]
     if metric_column and metric_column.upper() != "ALL" and (
@@ -459,6 +411,20 @@ def _design_gate(
             "offers": ["Choose a numeric business measure."],
             "question": "No measurable outcome. Which column is the metric?",
         }
+
+    if factor_column is not None and factor_column not in frame.columns:
+        raise DataParserError(f"Unknown factor column: {factor_column}")
+
+    if factor_column is None:
+        try:
+            candidate_factor = _infer_factor_column(frame)
+        except DataParserError:
+            candidate_factor = None
+    else:
+        candidate_factor = factor_column
+
+    if candidate_factor is None or candidate_factor not in frame.columns:
+        return None
     return None
 
 
@@ -545,11 +511,17 @@ def _infer_factor_column(frame: Any, factor_column: str | None = None) -> str:
         ),
         None,
     )
-    if not inferred:
-        raise DataParserError(
-            "Could not infer a categorical factor column with fewer than half as many unique values as rows"
-        )
-    return inferred
+    if inferred is not None:
+        return inferred
+
+    numeric_columns = [
+        str(column) for column in frame.columns if is_numeric_dtype(frame[column]) and not _is_disallowed_metric_column(column)
+    ]
+    if numeric_columns:
+        return "__row_index__"
+    raise DataParserError(
+        "Could not infer a categorical factor column with fewer than half as many unique values as rows"
+    )
 
 
 def _numeric_metric_columns(frame: Any, factor_column: str) -> list[str]:

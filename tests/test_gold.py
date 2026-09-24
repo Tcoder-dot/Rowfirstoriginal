@@ -494,7 +494,7 @@ R09,C,91.8,3
     assert "ID_Number" not in by_metric
 
 
-def test_api_gate_refuses_crm_row_id_and_index_design() -> None:
+def test_api_allows_generic_row_based_analysis_without_named_group_schema() -> None:
     os.environ["ROWFIRST_ID"] = "demo-id"
     os.environ["ROWFIRST_SECRET_KEY"] = "demo-secret"
     text = "Company,Website,Revenue,Index,Row ID\n" + "\n".join(
@@ -508,9 +508,21 @@ def test_api_gate_refuses_crm_row_id_and_index_design() -> None:
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["mode"] in {"ask", "refuse"}
-    assert payload["profile"]["n_rows"] == 100
-    assert payload["reason"] in {"no_obvious_group_column", "unique_or_singleton_groups"}
+    assert "factor" in payload
+    assert isinstance(payload["analyses"], list)
+    assert len(payload["analyses"]) >= 1
+
+
+def test_generic_numeric_table_is_allowed_without_expected_group_schema() -> None:
+    from api import _design_gate
+
+    frame = pd.DataFrame({
+        "Value_1": [10, 12, 14, 11, 9, 15],
+        "Value_2": [20, 22, 18, 24, 19, 21],
+        "Value_3": [30, 35, 32, 29, 33, 37],
+        "Value_4": [40, 38, 42, 41, 39, 43],
+    })
+    assert _design_gate(frame, None, None, None) is None
 
 
 def test_wide_company_like_table_requests_financial_schema_mapping() -> None:
